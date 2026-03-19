@@ -1,0 +1,19 @@
+{
+  "id": "3138ca72-4462-4ffd-a955-4049a76ad6c0",
+  "name": "ClarionAssistant",
+  "description": "AI-powered Clarion IDE assistant with embedded Claude Code terminal, MCP tools, LSP integration, and IDE automation",
+  "changeLog": "",
+  "currentVersion": "0.1.0",
+  "createdAt": "2026-03-19T08:14:48.9803010-07:00",
+  "lastOpenedAt": "2026-03-19T08:14:48.9803010-07:00",
+  "isPinned": false,
+  "prompts": [],
+  "team": {
+    "agents": [
+      {
+        "name": "Diana",
+        "role": "agent"
+      }
+    ]
+  }
+}
