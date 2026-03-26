@@ -43,23 +43,51 @@ namespace ClarionAssistant.Services
         /// <summary>
         /// Get the Application object from the active view (if an .app is open).
         /// </summary>
-        private object GetAppObject()
+        /// <summary>
+        /// Find the ViewContent for an open .app file. Checks active window first,
+        /// then searches all open windows so it works regardless of which tab is focused.
+        /// </summary>
+        private object FindAppViewContent()
         {
             try
             {
                 var workbench = WorkbenchSingleton.Workbench;
                 if (workbench == null) return null;
 
+                // Try active window first (fast path)
                 var activeWindow = GetProp(workbench, "ActiveWorkbenchWindow");
-                if (activeWindow == null) return null;
+                if (activeWindow != null)
+                {
+                    var vc = GetProp(activeWindow, "ViewContent")
+                          ?? GetProp(activeWindow, "ActiveViewContent");
+                    if (vc != null && GetProp(vc, "App") != null)
+                        return vc;
+                }
 
-                var viewContent = GetProp(activeWindow, "ViewContent")
-                               ?? GetProp(activeWindow, "ActiveViewContent");
-                if (viewContent == null) return null;
+                // Search all open windows for an app ViewContent
+                var windows = GetProp(workbench, "WorkbenchWindowCollection")
+                           ?? GetProp(workbench, "ViewContentCollection");
+                if (windows is System.Collections.IEnumerable enumerable)
+                {
+                    foreach (var win in enumerable)
+                    {
+                        var vc = GetProp(win, "ViewContent")
+                              ?? GetProp(win, "ActiveViewContent");
+                        if (vc != null && GetProp(vc, "App") != null)
+                            return vc;
+                    }
+                }
 
-                return GetProp(viewContent, "App");
+                return null;
             }
             catch { return null; }
+        }
+
+        private object GetAppObject()
+        {
+            var viewContent = FindAppViewContent();
+            if (viewContent == null) return null;
+            return GetProp(viewContent, "App");
         }
 
         /// <summary>
@@ -150,23 +178,52 @@ namespace ClarionAssistant.Services
                 var workbench = WorkbenchSingleton.Workbench;
                 if (workbench == null) return null;
 
-                var activeWindow = GetProp(workbench, "ActiveWorkbenchWindow");
-                if (activeWindow == null) return null;
-
-                var viewContent = GetProp(activeWindow, "ViewContent")
-                               ?? GetProp(activeWindow, "ActiveViewContent");
-                if (viewContent == null) return null;
-
-                var secViews = GetProp(viewContent, "SecondaryViewContents");
-                if (secViews is System.Collections.IEnumerable views)
+                // Helper to search a ViewContent for a ClaGenEditor
+                object SearchViewContent(object vc)
                 {
-                    foreach (var view in views)
+                    if (vc == null) return null;
+                    // Check if the ViewContent itself is a ClaGenEditor
+                    string vcType = vc.GetType().Name;
+                    if (vcType == "ClaGenEditor" || vcType.Contains("GenEditor"))
+                        return vc;
+                    // Check SecondaryViewContents
+                    var secViews = GetProp(vc, "SecondaryViewContents");
+                    if (secViews is System.Collections.IEnumerable views)
                     {
-                        string typeName = view.GetType().Name;
-                        if (typeName == "ClaGenEditor" || typeName.Contains("GenEditor"))
-                            return view;
+                        foreach (var view in views)
+                        {
+                            string typeName = view.GetType().Name;
+                            if (typeName == "ClaGenEditor" || typeName.Contains("GenEditor"))
+                                return view;
+                        }
+                    }
+                    return null;
+                }
+
+                // Try active window first (fast path)
+                var activeWindow = GetProp(workbench, "ActiveWorkbenchWindow");
+                if (activeWindow != null)
+                {
+                    var vc = GetProp(activeWindow, "ViewContent")
+                          ?? GetProp(activeWindow, "ActiveViewContent");
+                    var editor = SearchViewContent(vc);
+                    if (editor != null) return editor;
+                }
+
+                // Search all open windows (same pattern as FindAppViewContent)
+                var windows = GetProp(workbench, "WorkbenchWindowCollection")
+                           ?? GetProp(workbench, "ViewContentCollection");
+                if (windows is System.Collections.IEnumerable enumerable)
+                {
+                    foreach (var win in enumerable)
+                    {
+                        var vc = GetProp(win, "ViewContent")
+                              ?? GetProp(win, "ActiveViewContent");
+                        var editor = SearchViewContent(vc);
+                        if (editor != null) return editor;
                     }
                 }
+
                 return null;
             }
             catch { return null; }
@@ -314,11 +371,8 @@ namespace ClarionAssistant.Services
                 log.AppendLine("=== Iteration 14: PostMessage + AttachThreadInput ===");
                 log.AppendLine("Target: " + procedureName);
 
-                // --- Get the ApplicationMainWindowControl ---
-                var workbench = WorkbenchSingleton.Workbench;
-                var activeWindow = GetProp(workbench, "ActiveWorkbenchWindow");
-                var viewContent = GetProp(activeWindow, "ViewContent")
-                               ?? GetProp(activeWindow, "ActiveViewContent");
+                // --- Get the ApplicationMainWindowControl (searches all windows) ---
+                var viewContent = FindAppViewContent();
                 if (viewContent == null) return "Error: no ViewContent — is an .app file open?";
 
                 var container = GetProp(viewContent, "_Container")
@@ -569,11 +623,8 @@ namespace ClarionAssistant.Services
                 var log = new StringBuilder();
                 log.AppendLine("=== SelectProcedure: " + procedureName + " ===");
 
-                // --- Get the ApplicationMainWindowControl ---
-                var workbench = WorkbenchSingleton.Workbench;
-                var activeWindow = GetProp(workbench, "ActiveWorkbenchWindow");
-                var viewContent = GetProp(activeWindow, "ViewContent")
-                               ?? GetProp(activeWindow, "ActiveViewContent");
+                // --- Get the ApplicationMainWindowControl (searches all windows) ---
+                var viewContent = FindAppViewContent();
                 if (viewContent == null) return "Error: no ViewContent — is an .app file open?";
 
                 var container = GetProp(viewContent, "_Container")
@@ -666,17 +717,27 @@ namespace ClarionAssistant.Services
             if (editor == null) return null;
 
             // ClaGenEditor persists in SecondaryViewContents even when closed.
-            // Check AppName to determine if the embeditor is actually active.
+            // Use IGeneratorDialog as the active-embeditor indicator (same check that
+            // save_and_close_embeditor/cancel_embeditor rely on).
+            var dialogInterface = editor.GetType().GetInterface("SoftVelocity.Generator.IGeneratorDialog");
+            if (dialogInterface == null) return null;
+
             var appName = (GetProp(editor, "AppName") ?? "").ToString();
-            if (string.IsNullOrEmpty(appName)) return null;
+            var fileName = (GetProp(editor, "FileName") ?? "").ToString();
+
+            // ClaGenEditor persists with IGeneratorDialog even after closing.
+            // When actually active, at least one of appName/fileName will be populated.
+            if (string.IsNullOrEmpty(appName) && string.IsNullOrEmpty(fileName))
+                return null;
 
             return new Dictionary<string, object>
             {
                 { "appName", appName },
-                { "fileName", (GetProp(editor, "FileName") ?? "").ToString() },
+                { "fileName", fileName },
                 { "isPwee", GetProp(editor, "IsPwee") },
                 { "isOnFirstEmbed", GetProp(editor, "IsOnFirstEmbed") },
-                { "isOnLastEmbed", GetProp(editor, "IsOnLastEmbed") }
+                { "isOnLastEmbed", GetProp(editor, "IsOnLastEmbed") },
+                { "editorType", editor.GetType().Name }
             };
         }
 
@@ -787,6 +848,156 @@ namespace ClarionAssistant.Services
                     + (filledOnly ? " filled" : "")
                     + " embed";
                 return "Navigated to " + label + ".";
+            }
+            catch (Exception ex)
+            {
+                return "Error: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Get the Win32App object from the Application object.
+        /// This provides access to lower-level operations like Export/Import.
+        /// </summary>
+        private object GetWin32App()
+        {
+            var app = GetAppObject();
+            if (app == null) return null;
+            return GetProp(app, "Win32App");
+        }
+
+        /// <summary>
+        /// Export the current app (or selected procedures) to a TXA file.
+        /// </summary>
+        /// <param name="txaPath">Output TXA file path</param>
+        /// <param name="procedureNames">Optional list of procedure names to export. If null/empty, exports all.</param>
+        /// <returns>Status message</returns>
+        public string ExportTxa(string txaPath, List<string> procedureNames)
+        {
+            try
+            {
+                var win32App = GetWin32App();
+                if (win32App == null)
+                    return "Error: No .app file is currently open";
+
+                bool exportAll = (procedureNames == null || procedureNames.Count == 0);
+
+                if (!exportAll)
+                {
+                    // Deselect all modules first
+                    var deselectAll = win32App.GetType().GetMethod("ModulesSelectAll", AllInstance);
+                    if (deselectAll != null)
+                        deselectAll.Invoke(win32App, new object[] { false });
+
+                    // Find and select the requested procedures
+                    var procedures = GetProp(win32App, "Procedures") as Array;
+                    if (procedures == null)
+                        return "Error: Could not access procedures";
+
+                    var matched = new List<string>();
+                    foreach (var proc in procedures)
+                    {
+                        string name = GetProp(proc, "Name")?.ToString();
+                        if (name != null && procedureNames.Contains(name))
+                        {
+                            var selectMethod = proc.GetType().GetMethod("SelectAll", AllInstance);
+                            if (selectMethod != null)
+                                selectMethod.Invoke(proc, new object[] { true });
+                            matched.Add(name);
+                        }
+                    }
+
+                    if (matched.Count == 0)
+                        return "Error: None of the specified procedures were found in the app";
+                }
+
+                // Call Export(string txaName, bool all)
+                var exportMethod = win32App.GetType().GetMethod("Export", AllInstance,
+                    null, new Type[] { typeof(string), typeof(bool) }, null);
+
+                if (exportMethod == null)
+                    return "Error: Export method not found on Win32App";
+
+                bool result = (bool)exportMethod.Invoke(win32App, new object[] { txaPath, exportAll });
+
+                if (!result)
+                    return "Error: Export returned false — export may have failed";
+
+                // Verify the file was created (retry briefly — IDE may not have flushed to disk yet)
+                bool fileFound = false;
+                for (int i = 0; i < 10; i++)
+                {
+                    if (System.IO.File.Exists(txaPath))
+                    {
+                        fileFound = true;
+                        break;
+                    }
+                    System.Threading.Thread.Sleep(200);
+                }
+                if (!fileFound)
+                    return "Error: Export completed but TXA file was not created at " + txaPath;
+
+                long fileSize = new System.IO.FileInfo(txaPath).Length;
+                if (exportAll)
+                    return "Exported entire app to " + txaPath + " (" + fileSize + " bytes)";
+                else
+                    return "Exported " + procedureNames.Count + " procedure(s) to " + txaPath + " (" + fileSize + " bytes)";
+            }
+            catch (Exception ex)
+            {
+                return "Error: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Import a TXA file into the current app.
+        /// </summary>
+        /// <param name="txaPath">Input TXA file path</param>
+        /// <param name="clashMode">"rename" (default) or "replace"</param>
+        /// <returns>Status message</returns>
+        public string ImportTxa(string txaPath, string clashMode)
+        {
+            try
+            {
+                var win32App = GetWin32App();
+                if (win32App == null)
+                    return "Error: No .app file is currently open";
+
+                if (!System.IO.File.Exists(txaPath))
+                    return "Error: TXA file not found: " + txaPath;
+
+                // Resolve ImportClashMode enum value
+                // Values: Ask=0, Rename=2, Replace=3
+                var genAsm = win32App.GetType().Assembly;
+                var clashModeType = genAsm.GetType("Clarion.GEN.ImportClashMode");
+                if (clashModeType == null)
+                    return "Error: ImportClashMode enum not found";
+
+                object clashModeValue;
+                switch ((clashMode ?? "rename").ToLowerInvariant())
+                {
+                    case "replace":
+                        clashModeValue = Enum.ToObject(clashModeType, 3);
+                        break;
+                    case "rename":
+                    default:
+                        clashModeValue = Enum.ToObject(clashModeType, 2);
+                        break;
+                }
+
+                // Call Import(string txaName, ImportClashMode clashMode)
+                var importMethod = win32App.GetType().GetMethod("Import", AllInstance,
+                    null, new Type[] { typeof(string), clashModeType }, null);
+
+                if (importMethod == null)
+                    return "Error: Import method not found on Win32App";
+
+                bool result = (bool)importMethod.Invoke(win32App, new object[] { txaPath, clashModeValue });
+
+                if (!result)
+                    return "Error: Import returned false — import may have failed";
+
+                return "Successfully imported " + txaPath + " (clash mode: " + (clashMode ?? "rename") + ")";
             }
             catch (Exception ex)
             {

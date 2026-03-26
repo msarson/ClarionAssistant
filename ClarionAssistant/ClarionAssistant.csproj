@@ -73,6 +73,7 @@
     <Compile Include="Services\McpJsonRpc.cs" />
     <Compile Include="Services\McpToolRegistry.cs" />
     <Compile Include="Services\ClarionVersionService.cs" />
+    <Compile Include="Services\RedFileService.cs" />
     <Compile Include="Services\LspClient.cs" />
     <Compile Include="Services\LibraryIndexer.cs" />
     <Compile Include="Services\AppTreeService.cs" />
@@ -82,6 +83,10 @@
     <Compile Include="Terminal\ConPtyTerminal.cs" />
     <Compile Include="Terminal\WebViewTerminalRenderer.cs" />
     <Compile Include="Terminal\WebView2EnvironmentCache.cs" />
+    <Compile Include="Terminal\HeaderWebView.cs" />
+    <Compile Include="Terminal\DiffViewContent.cs" />
+    <Compile Include="Terminal\NativeDiffViewContent.cs" />
+    <Compile Include="Services\DiffService.cs" />
     <Compile Include="Models\MultiTerminalModels.cs" />
     <Compile Include="Services\MultiTerminalApiClient.cs" />
     <Compile Include="TaskLifecycleBoard\TaskLifecycleBoardForm.cs" />
@@ -92,6 +97,12 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="Terminal\terminal.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Terminal\header.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Terminal\diff.html">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="Terminal\clarion-assistant-prompt.md">

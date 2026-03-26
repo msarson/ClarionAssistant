@@ -24,6 +24,9 @@ namespace ClarionAssistant.Terminal
         private bool _isInitialized;
         private bool _isInitializing;
         private float _fontSize = 10f;
+        private string _fontFamily = "Cascadia Mono";
+
+        public event EventHandler<float> FontSizeChangedByUser;
         private int _cols = 80;
         private int _rows = 24;
 
@@ -151,6 +154,14 @@ namespace ClarionAssistant.Terminal
                     case "paste":
                         OnPasteRequested();
                         break;
+                    case "fontSizeChanged":
+                        float newSize;
+                        if (float.TryParse(message.Data, out newSize))
+                        {
+                            _fontSize = Math.Max(6f, Math.Min(32f, newSize));
+                            FontSizeChangedByUser?.Invoke(this, _fontSize);
+                        }
+                        break;
                 }
             }
             catch { }
@@ -164,7 +175,10 @@ namespace ClarionAssistant.Terminal
             _rows = message.Rows;
 
             if (_webView?.CoreWebView2 != null)
+            {
                 _webView.CoreWebView2.PostWebMessageAsString("fontSize:" + _fontSize.ToString());
+                _webView.CoreWebView2.PostWebMessageAsString("fontFamily:" + _fontFamily);
+            }
 
             while (_pendingData.Count > 0)
                 WriteToTerminalInternal(_pendingData.Dequeue());
@@ -264,6 +278,14 @@ namespace ClarionAssistant.Terminal
                 _webView.CoreWebView2.PostWebMessageAsString("fontSize:" + size.ToString());
         }
 
+        public void SetFontFamily(string family)
+        {
+            if (string.IsNullOrEmpty(family)) return;
+            _fontFamily = family;
+            if (_isInitialized && _webView?.CoreWebView2 != null)
+                _webView.CoreWebView2.PostWebMessageAsString("fontFamily:" + family);
+        }
+
         public void Clear()
         {
             if (_isInitialized && _webView?.CoreWebView2 != null)
@@ -334,11 +356,13 @@ namespace ClarionAssistant.Terminal
                     while (pos < json.Length && char.IsDigit(json[pos])) pos++;
                     if (pos > start)
                     {
+                        string numStr = json.Substring(start, pos - start);
                         int num;
-                        if (int.TryParse(json.Substring(start, pos - start), out num))
+                        if (int.TryParse(numStr, out num))
                         {
                             if (key == "cols") msg.Cols = num;
                             else if (key == "rows") msg.Rows = num;
+                            else if (key == "fontSize") msg.Data = numStr;
                         }
                     }
                 }

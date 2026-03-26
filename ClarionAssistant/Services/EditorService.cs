@@ -649,6 +649,55 @@ namespace ClarionAssistant.Services
         }
 
         /// <summary>
+        /// Get text of a range of lines (1-based) from the active editor buffer.
+        /// Returns lines with line numbers prefixed, one per line.
+        /// </summary>
+        public string GetLinesRange(int startLine, int endLine)
+        {
+            try
+            {
+                var textArea = GetActiveTextArea();
+                if (textArea == null) return null;
+                var document = GetProperty(textArea, "Document");
+                if (document == null) return null;
+
+                var totalLinesProp = document.GetType().GetProperty("TotalNumberOfLines");
+                int totalLines = totalLinesProp != null ? (int)totalLinesProp.GetValue(document, null) : 0;
+                if (totalLines == 0) return null;
+
+                if (startLine < 1) startLine = 1;
+                if (endLine > totalLines) endLine = totalLines;
+                if (startLine > endLine) return null;
+
+                string fullText = (GetProperty(document, "TextContent") ?? GetProperty(document, "Text")) as string;
+                if (fullText == null) return null;
+
+                var getLineMethod = document.GetType().GetMethod("GetLineSegment", new[] { typeof(int) });
+                if (getLineMethod == null) return null;
+
+                var sb = new System.Text.StringBuilder();
+                for (int i = startLine; i <= endLine; i++)
+                {
+                    var segment = getLineMethod.Invoke(document, new object[] { i - 1 });
+                    if (segment != null)
+                    {
+                        int offset = (int)GetProperty(segment, "Offset");
+                        int length = (int)GetProperty(segment, "Length");
+                        string lineText = (offset >= 0 && offset + length <= fullText.Length)
+                            ? fullText.Substring(offset, length) : "";
+                        sb.AppendLine(i + "\t" + lineText);
+                    }
+                    else
+                    {
+                        sb.AppendLine(i + "\t");
+                    }
+                }
+                return sb.ToString();
+            }
+            catch (Exception ex) { return "Error: " + ex.Message; }
+        }
+
+        /// <summary>
         /// Search for text in the active editor buffer. Returns list of (line, column, text) matches.
         /// </summary>
         public List<int[]> FindInFile(string searchText, bool caseSensitive = false)

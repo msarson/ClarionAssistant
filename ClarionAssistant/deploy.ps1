@@ -15,6 +15,11 @@ $BuildOutput = Join-Path $ProjectDir "bin\Debug"
 $DeployDir   = "C:\Clarion12\accessory\addins\ClarionAssistant"
 $MSBuild     = "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
 
+# Indexer build output (separate project, shares source files with ClarionCodeGraph)
+$IndexerDir  = "H:\DevLaptop\ClarionLSP\indexer"
+$IndexerFile = Join-Path $IndexerDir "ClarionIndexer.csproj"
+$IndexerOutput = Join-Path $IndexerDir "bin\Debug"
+
 # Files and folders to deploy
 $Items = @(
     "ClarionAssistant.dll"
@@ -40,6 +45,11 @@ if (-not $NoBuild) {
     if ($LASTEXITCODE -ne 0) { Write-Host "Build failed." -ForegroundColor Red; exit 1 }
 
     Write-Host "Build succeeded." -ForegroundColor Green
+
+    Write-Host "Building indexer..." -ForegroundColor Cyan
+    & $MSBuild $IndexerFile /p:Configuration=Debug /v:minimal
+    if ($LASTEXITCODE -ne 0) { Write-Host "Indexer build failed." -ForegroundColor Red; exit 1 }
+    Write-Host "Indexer build succeeded." -ForegroundColor Green
 }
 
 # --- Kill Clarion IDE if requested ---
@@ -79,6 +89,39 @@ foreach ($item in $Items) {
             Copy-Item $src $dst -Force
         }
         Write-Host "  OK    $item" -ForegroundColor Green
+        $copied++
+    }
+    catch {
+        Write-Host "  FAIL  $item - $($_.Exception.Message)" -ForegroundColor Red
+        $failed++
+    }
+}
+
+# --- Deploy indexer ---
+$IndexerItems = @(
+    "clarion-indexer.exe"
+    "clarion-indexer.pdb"
+    "System.Data.SQLite.dll"
+    "x86"
+)
+
+foreach ($item in $IndexerItems) {
+    $src = Join-Path $IndexerOutput $item
+    $dst = Join-Path $DeployDir $item
+
+    if (-not (Test-Path $src)) {
+        Write-Host "  SKIP  $item (not found in indexer output)" -ForegroundColor DarkGray
+        continue
+    }
+
+    try {
+        if (Test-Path $src -PathType Container) {
+            if (Test-Path $dst) { Remove-Item $dst -Recurse -Force }
+            Copy-Item $src $dst -Recurse -Force
+        } else {
+            Copy-Item $src $dst -Force
+        }
+        Write-Host "  OK    $item (indexer)" -ForegroundColor Green
         $copied++
     }
     catch {

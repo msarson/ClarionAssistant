@@ -32,6 +32,7 @@ namespace ClarionAssistant.Services
         private readonly AppTreeService _appTree;
         private ClaudeChatControl _chatControl;
         private LspClient _lspClient;
+        private DiffService _diffService;
 
         public McpToolRegistry(EditorService editorService, ClarionClassParser parser)
         {
@@ -47,6 +48,11 @@ namespace ClarionAssistant.Services
         public void SetChatControl(ClaudeChatControl control)
         {
             _chatControl = control;
+        }
+
+        public void SetDiffService(DiffService diffService)
+        {
+            _diffService = diffService;
         }
 
         public int GetToolCount() { return _tools.Count; }
@@ -346,6 +352,27 @@ namespace ClarionAssistant.Services
 
             Register(new McpTool
             {
+                Name = "get_lines_range",
+                Description = "Get text of multiple lines (1-based) from the active editor buffer in one call. Returns lines prefixed with line numbers. Much faster than calling get_line_text repeatedly.",
+                InputSchema = McpJsonRpc.BuildSchema(
+                    new Dictionary<string, string>
+                    {
+                        { "start_line", "First line to read (1-based)" },
+                        { "end_line", "Last line to read (1-based, inclusive)" }
+                    },
+                    new[] { "start_line", "end_line" }),
+                RequiresUiThread = true,
+                Handler = args =>
+                {
+                    int startLine = McpJsonRpc.GetInt(args, "start_line", 1);
+                    int endLine = McpJsonRpc.GetInt(args, "end_line", startLine);
+                    string result = _editorService.GetLinesRange(startLine, endLine);
+                    return result ?? "Error: could not read lines " + startLine + "-" + endLine;
+                }
+            });
+
+            Register(new McpTool
+            {
                 Name = "find_in_file",
                 Description = "Search for text in the active editor buffer (includes unsaved changes). Returns matching line numbers and columns.",
                 InputSchema = McpJsonRpc.BuildSchema(
@@ -609,6 +636,66 @@ Use this tool to discover IDE APIs and understand what's available for automatio
                 InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>()),
                 RequiresUiThread = true,
                 Handler = args => _appTree.NavigateEmbed("prev", true)
+            });
+
+            // === TXA Export/Import Tools ===
+
+            Register(new McpTool
+            {
+                Name = "export_txa",
+                Description = "Export the current Clarion app (or selected procedures) to a TXA (Text Application) file. If no procedures specified, exports the entire app.",
+                InputSchema = McpJsonRpc.BuildSchema(
+                    new Dictionary<string, string>
+                    {
+                        { "path", "Absolute path for the output TXA file" },
+                        { "procedures", "Comma-separated list of procedure names to export (optional — omit to export entire app)" }
+                    },
+                    new[] { "path" }),
+                RequiresUiThread = true,
+                Handler = args =>
+                {
+                    string path = McpJsonRpc.GetString(args, "path");
+                    if (string.IsNullOrEmpty(path))
+                        return "Error: path is required";
+
+                    string procsStr = McpJsonRpc.GetString(args, "procedures");
+                    List<string> procList = null;
+                    if (!string.IsNullOrEmpty(procsStr))
+                    {
+                        procList = new List<string>();
+                        foreach (var p in procsStr.Split(','))
+                        {
+                            string trimmed = p.Trim();
+                            if (trimmed.Length > 0)
+                                procList.Add(trimmed);
+                        }
+                    }
+
+                    return _appTree.ExportTxa(path, procList);
+                }
+            });
+
+            Register(new McpTool
+            {
+                Name = "import_txa",
+                Description = "Import a TXA (Text Application) file into the currently open Clarion app. Use clash_mode to control what happens when procedure names conflict.",
+                InputSchema = McpJsonRpc.BuildSchema(
+                    new Dictionary<string, string>
+                    {
+                        { "path", "Absolute path to the TXA file to import" },
+                        { "clash_mode", "How to handle name conflicts: 'rename' (default) auto-renames clashing procedures, 'replace' overwrites existing procedures" }
+                    },
+                    new[] { "path" }),
+                RequiresUiThread = true,
+                Handler = args =>
+                {
+                    string path = McpJsonRpc.GetString(args, "path");
+                    if (string.IsNullOrEmpty(path))
+                        return "Error: path is required";
+
+                    string clashMode = McpJsonRpc.GetString(args, "clash_mode");
+                    return _appTree.ImportTxa(path, clashMode);
+                }
             });
 
             // === File System Tools ===
@@ -1055,7 +1142,102 @@ COMMON QUERIES:
                             result["macros"] = vConfig.Macros;
                     }
 
+                    var red = _chatControl.RedFile;
+                    if (red != null && red.RedFilePath != null)
+                    {
+                        result["activeRedFile"] = red.RedFilePath;
+                        result["redSections"] = red.Sections.Keys.ToArray();
+                        // Include CLW and INC search paths so the AI knows where classes live
+                        result["clwSearchPaths"] = red.GetSearchPaths(".clw");
+                        result["incSearchPaths"] = red.GetSearchPaths(".inc");
+                    }
+
                     return result;
+                }
+            });
+
+            Register(new McpTool
+            {
+                Name = "resolve_red_path",
+                Description = "Resolve a Clarion filename (e.g. 'MyClass.inc', 'MyClass.clw') to its full path using the active .red (redirection) file. Searches Common section by default. Returns the first existing file match.",
+                InputSchema = McpJsonRpc.BuildSchema(
+                    new Dictionary<string, string>
+                    {
+                        { "filename", "The filename to resolve (e.g. 'MyClass.inc', 'StringClass.clw')" },
+                        { "section", "Red file section to search (default: 'Common'). Other options: 'Debug32', 'Release32', 'Copy'" }
+                    },
+                    new[] { "filename" }),
+                RequiresUiThread = false,
+                Handler = args =>
+                {
+                    if (_chatControl == null)
+                        return "Error: chat control not initialized";
+
+                    var red = _chatControl.RedFile;
+                    if (red == null || red.RedFilePath == null)
+                        return "Error: no .red file loaded. Select a version and solution first.";
+
+                    string fileName = McpJsonRpc.GetString(args, "filename", "");
+                    string section = McpJsonRpc.GetString(args, "section", "Common");
+
+                    if (string.IsNullOrEmpty(fileName))
+                        return "Error: filename is required";
+
+                    string resolved = red.Resolve(fileName, section);
+                    if (resolved != null)
+                        return new Dictionary<string, object>
+                        {
+                            { "filename", fileName },
+                            { "resolvedPath", resolved },
+                            { "found", true }
+                        };
+
+                    // Not found - return the search paths so the user knows where we looked
+                    string ext = System.IO.Path.GetExtension(fileName);
+                    var searchPaths = red.GetSearchPaths(ext, section);
+                    return new Dictionary<string, object>
+                    {
+                        { "filename", fileName },
+                        { "found", false },
+                        { "searchedPaths", searchPaths }
+                    };
+                }
+            });
+
+            Register(new McpTool
+            {
+                Name = "get_red_search_paths",
+                Description = "Get all search directories for a file extension from the .red file. Useful for discovering where Clarion source files, includes, and libraries are located.",
+                InputSchema = McpJsonRpc.BuildSchema(
+                    new Dictionary<string, string>
+                    {
+                        { "extension", "File extension to look up (e.g. 'clw', 'inc', 'lib', 'dll')" },
+                        { "section", "Red file section (default: 'Common')" }
+                    },
+                    new[] { "extension" }),
+                RequiresUiThread = false,
+                Handler = args =>
+                {
+                    if (_chatControl == null)
+                        return "Error: chat control not initialized";
+
+                    var red = _chatControl.RedFile;
+                    if (red == null || red.RedFilePath == null)
+                        return "Error: no .red file loaded. Select a version and solution first.";
+
+                    string ext = McpJsonRpc.GetString(args, "extension", "");
+                    string section = McpJsonRpc.GetString(args, "section", "Common");
+
+                    if (string.IsNullOrEmpty(ext))
+                        return "Error: extension is required";
+
+                    return new Dictionary<string, object>
+                    {
+                        { "extension", ext },
+                        { "section", section },
+                        { "searchPaths", red.GetSearchPaths(ext, section) },
+                        { "redFile", red.RedFilePath }
+                    };
                 }
             });
 
@@ -1253,6 +1435,86 @@ COMMON QUERIES:
                     string query = McpJsonRpc.GetString(args, "query");
                     var result = _lspClient.FindWorkspaceSymbol(query);
                     return FormatLspResult(result);
+                }
+            });
+
+            // === Diff Viewer Tools ===
+            Register(new McpTool
+            {
+                Name = "show_diff",
+                Description = "Open a side-by-side diff viewer in the IDE editor panel. The left pane shows the original text (read-only) and the right pane shows the modified text (editable). " +
+                    "You can provide text directly via original_text/modified_text, OR provide file paths via original_file/modified_file to load from disk (avoids encoding issues with large files). " +
+                    "Use ignore_whitespace to suppress trivial whitespace-only differences. Use get_diff_result to check the outcome.",
+                InputSchema = McpJsonRpc.BuildSchema(
+                    new Dictionary<string, string>
+                    {
+                        { "title", "Title for the diff tab (e.g. procedure name or file name)" },
+                        { "original_text", "The original (before) text. Not needed if original_file is provided." },
+                        { "modified_text", "The modified (after) text. Not needed if modified_file is provided." },
+                        { "original_file", "Path to a file to load as the original (left) side. Overrides original_text." },
+                        { "modified_file", "Path to a file to load as the modified (right) side. Overrides modified_text. Preferred for large files." },
+                        { "original_start_line", "First line to include from original_file (1-based, default: 1)" },
+                        { "original_end_line", "Last line to include from original_file (1-based, default: end of file)" },
+                        { "modified_start_line", "First line to include from modified_file (1-based, default: 1)" },
+                        { "modified_end_line", "Last line to include from modified_file (1-based, default: end of file)" },
+                        { "ignore_whitespace", "Set to 'true' to ignore leading/trailing whitespace differences (default: false)" },
+                        { "language", "Syntax highlighting language (default: clarion). Options: clarion, csharp, javascript, html, css, xml, json, plaintext" }
+                    },
+                    new[] { "title" }),
+                RequiresUiThread = true,
+                Handler = args =>
+                {
+                    if (_diffService == null)
+                        return "Error: Diff service not available.";
+
+                    string title = McpJsonRpc.GetString(args, "title");
+                    string language = McpJsonRpc.GetString(args, "language") ?? "clarion";
+                    bool ignoreWs = McpJsonRpc.GetString(args, "ignore_whitespace") == "true";
+
+                    string originalFile = McpJsonRpc.GetString(args, "original_file");
+                    string modifiedFile = McpJsonRpc.GetString(args, "modified_file");
+
+                    // Both files provided — load both from disk (best path, avoids MCP text encoding issues)
+                    if (!string.IsNullOrEmpty(originalFile) && !string.IsNullOrEmpty(modifiedFile))
+                    {
+                        int origStart = McpJsonRpc.GetInt(args, "original_start_line", 1);
+                        int origEnd = McpJsonRpc.GetInt(args, "original_end_line", -1);
+                        int modStart = McpJsonRpc.GetInt(args, "modified_start_line", 1);
+                        int modEnd = McpJsonRpc.GetInt(args, "modified_end_line", -1);
+                        return _diffService.ShowDiffFromFiles(title, originalFile, origStart, origEnd,
+                            modifiedFile, modStart, modEnd, language, ignoreWs);
+                    }
+
+                    // Original from file, modified from text parameter
+                    if (!string.IsNullOrEmpty(originalFile))
+                    {
+                        string modified = McpJsonRpc.GetString(args, "modified_text") ?? "";
+                        int startLine = McpJsonRpc.GetInt(args, "original_start_line", 1);
+                        int endLine = McpJsonRpc.GetInt(args, "original_end_line", -1);
+                        return _diffService.ShowDiffFromFile(title, originalFile, startLine, endLine, modified, language, ignoreWs);
+                    }
+
+                    // Both from text parameters
+                    string original = McpJsonRpc.GetString(args, "original_text") ?? "";
+                    string modifiedText = McpJsonRpc.GetString(args, "modified_text") ?? "";
+                    return _diffService.ShowDiff(title, original, modifiedText, language, ignoreWs);
+                }
+            });
+
+            Register(new McpTool
+            {
+                Name = "get_diff_result",
+                Description = "Check the result of the diff viewer. Returns 'pending' if the developer hasn't acted yet, 'applied' with the final text if they clicked Apply, or 'cancelled' if they dismissed it.",
+                InputSchema = McpJsonRpc.BuildSchema(
+                    new Dictionary<string, string>(),
+                    new string[0]),
+                RequiresUiThread = false,
+                Handler = args =>
+                {
+                    if (_diffService == null)
+                        return "Error: Diff service not available.";
+
+                    return _diffService.GetResult();
                 }
             });
         }

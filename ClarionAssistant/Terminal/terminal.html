@@ -271,6 +271,10 @@
                             setFontSize(parseFloat(data));
                             break;
 
+                        case 'fontFamily':
+                            setFontFamily(data);
+                            break;
+
                         case 'clear':
                             term.clear();
                             break;
@@ -375,6 +379,16 @@
             currentFontSize = size;
             if (term) {
                 term.options.fontSize = size;
+                if (fitAddon) {
+                    fitAddon.fit();
+                }
+            }
+        }
+
+        // Set font family
+        function setFontFamily(family) {
+            if (term && family) {
+                term.options.fontFamily = '"' + family + '", Consolas, "Courier New", monospace';
                 if (fitAddon) {
                     fitAddon.fit();
                 }

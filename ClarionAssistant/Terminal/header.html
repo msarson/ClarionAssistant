@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<!-- Prefetch Monaco so the diff viewer opens fast -->
+<link rel="prefetch" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js">
+<link rel="prefetch" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/editor/editor.main.js">
+<link rel="prefetch" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/editor/editor.main.css">
+<link rel="prefetch" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/editor/editor.main.nls.js">
+<link rel="prefetch" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/base/worker/workerMain.js">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', sans-serif;
+    font-size: 12px;
+    background: #1e1e2e;
+    color: #cdd6f4;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .header {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    padding: 6px 10px 4px 10px;
+  }
+
+  /* Title row */
+  .title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 5px;
+  }
+  .title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #89b4fa;
+    letter-spacing: 0.5px;
+  }
+  .title .icon { margin-right: 6px; }
+  .status {
+    font-size: 11px;
+    color: #6c7086;
+    white-space: nowrap;
+  }
+  .status.connected { color: #a6e3a1; }
+  .status.error { color: #f38ba8; }
+
+  /* Form rows */
+  .form-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+  }
+  .form-label {
+    font-size: 11px;
+    color: #7f849c;
+    min-width: 52px;
+    text-align: right;
+  }
+  .form-select {
+    flex: 1;
+    height: 24px;
+    background: #313244;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    padding: 0 6px;
+    font-size: 11px;
+    font-family: 'Segoe UI', sans-serif;
+    outline: none;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236c7086'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 6px center;
+    padding-right: 20px;
+  }
+  .form-select:hover { border-color: #585b70; }
+  .form-select:focus { border-color: #89b4fa; }
+
+  /* Buttons */
+  .btn {
+    height: 24px;
+    padding: 0 10px;
+    border: 1px solid #45475a;
+    border-radius: 4px;
+    background: #313244;
+    color: #cdd6f4;
+    font-size: 11px;
+    font-family: 'Segoe UI', sans-serif;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s;
+  }
+  .btn:hover { background: #45475a; border-color: #585b70; }
+  .btn:active { background: #585b70; }
+
+  .btn-icon {
+    width: 26px;
+    padding: 0;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .btn-primary {
+    background: #1e66a8;
+    border-color: #2580d4;
+    color: #fff;
+    font-weight: 600;
+  }
+  .btn-primary:hover { background: #2580d4; }
+  .btn-primary:active { background: #1e66a8; }
+
+  .btn-accent {
+    color: #89dceb;
+    border-color: rgba(137, 220, 235, 0.3);
+  }
+  .btn-accent:hover { background: rgba(137, 220, 235, 0.1); border-color: rgba(137, 220, 235, 0.5); }
+
+  .index-status {
+    font-size: 11px;
+    color: #a6e3a1;
+    margin-left: 4px;
+    white-space: nowrap;
+  }
+  .index-status.warning { color: #fab387; }
+  .index-status.active { color: #89b4fa; }
+  .index-status.error { color: #f38ba8; }
+
+  /* Divider */
+  .divider {
+    height: 1px;
+    background: #313244;
+    margin: 4px 0;
+  }
+
+  /* Action bar */
+  .action-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .action-bar .spacer { flex: 1; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <!-- Title row -->
+    <div class="title-row">
+      <span class="title"><span class="icon">&#9670;</span>Clarion Assistant</span>
+      <span id="status" class="status">Starting...</span>
+    </div>
+
+    <!-- Version row -->
+    <div class="form-row">
+      <span class="form-label">Version</span>
+      <select id="versionSelect" class="form-select"></select>
+      <button class="btn btn-icon" onclick="send('refresh')" title="Detect from IDE">&#8635;</button>
+    </div>
+
+    <!-- Solution row -->
+    <div class="form-row">
+      <span class="form-label">Solution</span>
+      <select id="solutionSelect" class="form-select"></select>
+      <button class="btn btn-icon" onclick="send('browse')" title="Browse for solution">&#8230;</button>
+      <button class="btn btn-primary" onclick="send('fullIndex')" id="btnFullIndex">Full Index</button>
+      <button class="btn" onclick="send('updateIndex')" id="btnUpdate">Update</button>
+      <span id="indexStatus" class="index-status"></span>
+    </div>
+
+    <!-- Font row -->
+    <div class="form-row">
+      <span class="form-label">Font</span>
+      <select id="fontFamilySelect" class="form-select" style="flex:2">
+        <option value="Cascadia Mono">Cascadia Mono</option>
+        <option value="Consolas">Consolas</option>
+        <option value="Courier New">Courier New</option>
+        <option value="Lucida Console">Lucida Console</option>
+        <option value="Fira Code">Fira Code</option>
+        <option value="JetBrains Mono">JetBrains Mono</option>
+        <option value="Source Code Pro">Source Code Pro</option>
+      </select>
+      <span class="form-label" style="min-width:30px">Size</span>
+      <select id="fontSizeSelect" class="form-select" style="flex:0 0 60px"></select>
+    </div>
+
+    <div class="divider"></div>
+
+    <!-- Action bar -->
+    <div class="action-bar">
+      <button class="btn" onclick="send('newChat')">New Chat</button>
+      <button class="btn" onclick="send('settings')">&#9881; Settings</button>
+      <button class="btn btn-accent" onclick="send('createCom')">+ Create COM</button>
+      <span class="spacer"></span>
+    </div>
+  </div>
+
+<script>
+  function send(action, data) {
+    window.chrome.webview.postMessage(JSON.stringify({ action: action, data: data || null }));
+  }
+
+  // Version select change
+  document.getElementById('versionSelect').addEventListener('change', function() {
+    send('versionChanged', this.value);
+  });
+
+  // Solution select change
+  document.getElementById('solutionSelect').addEventListener('change', function() {
+    send('solutionChanged', this.value);
+  });
+
+  // Font family select change
+  document.getElementById('fontFamilySelect').addEventListener('change', function() {
+    send('fontFamilyChanged', this.value);
+  });
+
+  // Font size select — populate 6-32
+  (function() {
+    var sel = document.getElementById('fontSizeSelect');
+    for (var s = 6; s <= 32; s++) {
+      var opt = document.createElement('option');
+      opt.value = s;
+      opt.textContent = s;
+      sel.appendChild(opt);
+    }
+    sel.value = '14'; // default
+    sel.addEventListener('change', function() {
+      send('fontSizeChanged', this.value);
+    });
+  })();
+
+  // Receive messages from C#
+  window.chrome.webview.addEventListener('message', function(e) {
+    var msg = JSON.parse(e.data);
+
+    if (msg.type === 'setVersions') {
+      var sel = document.getElementById('versionSelect');
+      sel.innerHTML = '';
+      msg.items.forEach(function(item) {
+        var opt = document.createElement('option');
+        opt.value = item.value;
+        opt.textContent = item.label;
+        if (item.selected) opt.selected = true;
+        sel.appendChild(opt);
+      });
+    }
+
+    if (msg.type === 'setSolutions') {
+      var sel = document.getElementById('solutionSelect');
+      sel.innerHTML = '';
+      msg.items.forEach(function(item) {
+        var opt = document.createElement('option');
+        opt.value = item.value;
+        opt.textContent = item.label;
+        if (item.selected) opt.selected = true;
+        sel.appendChild(opt);
+      });
+    }
+
+    if (msg.type === 'setStatus') {
+      var el = document.getElementById('status');
+      el.textContent = msg.text;
+      el.className = 'status ' + (msg.css || '');
+    }
+
+    if (msg.type === 'setIndexStatus') {
+      var el = document.getElementById('indexStatus');
+      el.textContent = msg.text;
+      el.className = 'index-status ' + (msg.css || '');
+    }
+
+    if (msg.type === 'setIndexButtons') {
+      document.getElementById('btnFullIndex').disabled = !msg.enabled;
+      document.getElementById('btnUpdate').disabled = !msg.enabled;
+    }
+
+    if (msg.type === 'setFontFamily') {
+      var sel = document.getElementById('fontFamilySelect');
+      // If the saved font is in our list, select it; otherwise add it
+      var found = false;
+      for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === msg.value) { sel.selectedIndex = i; found = true; break; }
+      }
+      if (!found && msg.value) {
+        var opt = document.createElement('option');
+        opt.value = msg.value;
+        opt.textContent = msg.value;
+        sel.appendChild(opt);
+        opt.selected = true;
+      }
+    }
+
+    if (msg.type === 'setFontSize') {
+      document.getElementById('fontSizeSelect').value = msg.value;
+    }
+  });
+</script>
+</body>
+</html>

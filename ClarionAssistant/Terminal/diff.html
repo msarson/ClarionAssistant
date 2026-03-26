@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Diff Viewer</title>
+<!-- Prefetch Monaco resources so subsequent loads are instant from cache -->
+<link rel="prefetch" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js">
+<link rel="prefetch" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/editor/editor.main.js">
+<link rel="prefetch" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/editor/editor.main.css">
+<link rel="prefetch" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/editor/editor.main.nls.js">
+<link rel="prefetch" href="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/base/worker/workerMain.js">
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    /* ---------- Theme variables ---------- */
+    :root {
+        --bg: #1e1e2e; --fg: #cdd6f4;
+        --toolbar-bg: #181825; --toolbar-border: #313244;
+        --title-color: #a6adc8; --title-accent: #cdd6f4;
+        --btn-border: #45475a; --btn-hover: #313244;
+        --nav-color: #89b4fa; --nav-border: #585b70;
+        --counter-color: #a6adc8;
+        --apply-bg: #a6e3a1; --apply-text: #1e1e2e; --apply-hover: #94e2d5;
+        --cancel-color: #cdd6f4;
+        --accent: #89b4fa; --accent-border: #89b4fa; --accent-hover: #1e3a5f;
+        --loading-color: #6c7086;
+        --theme-icon: "\263E"; /* moon */
+    }
+    body.light {
+        --bg: #eff1f5; --fg: #4c4f69;
+        --toolbar-bg: #dce0e8; --toolbar-border: #bcc0cc;
+        --title-color: #6c6f85; --title-accent: #4c4f69;
+        --btn-border: #acb0be; --btn-hover: #ccd0da;
+        --nav-color: #1e66f5; --nav-border: #acb0be;
+        --counter-color: #6c6f85;
+        --apply-bg: #40a02b; --apply-text: #ffffff; --apply-hover: #37913a;
+        --cancel-color: #4c4f69;
+        --accent: #1e66f5; --accent-border: #1e66f5; --accent-hover: #dce5f7;
+        --loading-color: #8c8fa1;
+        --theme-icon: "\2600"; /* sun */
+    }
+
+    html, body { height: 100%; overflow: hidden; font-family: 'Segoe UI', Tahoma, sans-serif; background: var(--bg); color: var(--fg); }
+
+    #toolbar {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 6px 12px; background: var(--toolbar-bg); border-bottom: 1px solid var(--toolbar-border);
+        height: 38px;
+    }
+    #toolbar .title { font-size: 13px; color: var(--title-color); }
+    #toolbar .title span { color: var(--title-accent); font-weight: 600; }
+    #toolbar .nav { display: flex; align-items: center; gap: 4px; }
+    #toolbar .nav button {
+        padding: 3px 10px; border: 1px solid var(--nav-border); border-radius: 4px;
+        font-size: 12px; cursor: pointer; font-family: inherit;
+        background: transparent; color: var(--nav-color);
+    }
+    #toolbar .nav button:hover { background: var(--btn-hover); }
+    #toolbar .nav button:disabled { opacity: 0.3; cursor: default; }
+    #diff-counter {
+        font-size: 11px; color: var(--counter-color); min-width: 80px; text-align: center;
+        user-select: none;
+    }
+    #toolbar .buttons { display: flex; gap: 8px; }
+    #toolbar button {
+        padding: 4px 16px; border: 1px solid var(--btn-border); border-radius: 4px;
+        font-size: 12px; cursor: pointer; font-family: inherit;
+    }
+    #btn-apply {
+        background: var(--apply-bg); color: var(--apply-text); border-color: var(--apply-bg); font-weight: 600;
+    }
+    #btn-apply:hover { background: var(--apply-hover); }
+    #btn-cancel {
+        background: transparent; color: var(--cancel-color);
+    }
+    #btn-cancel:hover { background: var(--btn-hover); }
+    #btn-inline, #btn-theme, #btn-whitespace {
+        background: transparent; color: var(--accent); border-color: var(--accent-border); font-size: 11px;
+    }
+    #btn-inline:hover, #btn-theme:hover, #btn-whitespace:hover { background: var(--accent-hover); }
+    #btn-whitespace.active { background: var(--accent); color: var(--bg); }
+    #btn-theme { min-width: 28px; padding: 4px 8px; font-size: 14px; line-height: 1; }
+
+    #font-family-select {
+        padding: 2px 4px; border: 1px solid var(--btn-border); border-radius: 4px;
+        background: var(--toolbar-bg); color: var(--fg); font-size: 11px; font-family: inherit;
+        cursor: pointer; max-width: 150px;
+    }
+    #font-family-select:focus { outline: 1px solid var(--accent-border); }
+    #font-size-input {
+        width: 48px; padding: 2px 4px; border: 1px solid var(--btn-border); border-radius: 4px;
+        background: transparent; color: var(--fg); font-size: 11px; font-family: inherit;
+        text-align: center; -moz-appearance: textfield;
+    }
+    #font-size-input::-webkit-inner-spin-button,
+    #font-size-input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    #font-size-input:focus { outline: 1px solid var(--accent-border); }
+    .font-label { font-size: 11px; color: var(--counter-color); user-select: none; }
+
+    #editor-container { height: calc(100% - 38px); width: 100%; }
+
+    #loading {
+        display: flex; align-items: center; justify-content: center;
+        height: calc(100% - 38px); color: var(--loading-color); font-size: 14px;
+    }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+    <div class="title" id="diff-title">Diff: <span id="diff-name">Loading...</span></div>
+    <div class="nav">
+        <button id="btn-prev" onclick="goToPrevDiff()" title="Previous change (Shift+F7)" disabled>&#9650; Prev</button>
+        <span id="diff-counter">--</span>
+        <button id="btn-next" onclick="goToNextDiff()" title="Next change (F7)" disabled>Next &#9660;</button>
+    </div>
+    <div class="buttons">
+        <span class="font-label">Font:</span>
+        <select id="font-family-select" title="Font family">
+            <option value="'Cascadia Code', 'Consolas', monospace">Cascadia Code</option>
+            <option value="'Consolas', monospace">Consolas</option>
+            <option value="'Courier New', monospace">Courier New</option>
+            <option value="'Fira Code', monospace">Fira Code</option>
+            <option value="'JetBrains Mono', monospace">JetBrains Mono</option>
+            <option value="'Source Code Pro', monospace">Source Code Pro</option>
+            <option value="'Cascadia Mono', monospace">Cascadia Mono</option>
+            <option value="'Lucida Console', monospace">Lucida Console</option>
+        </select>
+        <input id="font-size-input" type="number" min="8" max="40" list="font-sizes"
+               title="Font size (type or pick)" />
+        <datalist id="font-sizes">
+            <option value="10"><option value="11"><option value="12"><option value="13">
+            <option value="14"><option value="16"><option value="18"><option value="20">
+            <option value="24"><option value="28"><option value="32">
+        </datalist>
+        <button id="btn-theme" onclick="toggleTheme()" title="Toggle light/dark mode">&#9790;</button>
+        <button id="btn-whitespace" onclick="toggleWhitespace()" title="Toggle whitespace comparison">Ignore WS</button>
+        <button id="btn-inline" onclick="toggleInline()">Inline</button>
+        <button id="btn-cancel" onclick="onCancel()">Cancel</button>
+        <button id="btn-apply" onclick="onApply()">Apply</button>
+    </div>
+</div>
+
+<div id="loading">Loading Monaco Editor...</div>
+<div id="editor-container" style="display:none;"></div>
+
+<script>
+    var diffEditor = null;
+    var isInline = false;
+    var isDark = true;
+    var ignoreWhitespace = false;
+    var currentDiffIndex = -1;
+    var diffChanges = [];
+    var rawOriginal = '';
+    var rawModified = '';
+
+    // Load Monaco from CDN
+    var loadStart = performance.now();
+    var script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js';
+    script.onload = function() {
+        console.log('[DiffViewer] loader.js loaded in ' + Math.round(performance.now() - loadStart) + 'ms');
+        require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs' } });
+        require(['vs/editor/editor.main'], function() {
+            console.log('[DiffViewer] Monaco ready in ' + Math.round(performance.now() - loadStart) + 'ms');
+            registerClarionLanguage();
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('editor-container').style.display = 'block';
+            notifyReady();
+        });
+    };
+    script.onerror = function() {
+        document.getElementById('loading').textContent = 'Failed to load Monaco Editor. Check internet connection.';
+    };
+    document.head.appendChild(script);
+
+    function registerClarionLanguage() {
+        monaco.languages.register({ id: 'clarion' });
+        monaco.languages.setMonarchTokensProvider('clarion', {
+            ignoreCase: true,
+            keywords: [
+                'PROCEDURE', 'FUNCTION', 'ROUTINE', 'CODE', 'DATA', 'MAP', 'END',
+                'IF', 'THEN', 'ELSIF', 'ELSE', 'OF', 'CASE', 'OROF', 'EXECUTE',
+                'LOOP', 'WHILE', 'UNTIL', 'TIMES', 'DO', 'CYCLE', 'BREAK', 'EXIT',
+                'RETURN', 'BEGIN', 'SECTION', 'ACCEPT', 'MEMBER', 'INCLUDE', 'ONCE',
+                'MODULE', 'PROGRAM', 'CLASS', 'VIRTUAL', 'DERIVED', 'TYPE', 'IMPLEMENTS',
+                'INTERFACE', 'PRIVATE', 'PROTECTED', 'PUBLIC', 'SELF', 'PARENT',
+                'NEW', 'DISPOSE', 'FREE', 'CLEAR', 'ADD', 'GET', 'PUT', 'DELETE',
+                'SORT', 'RECORDS', 'APPEND', 'CLIP', 'LEFT', 'RIGHT', 'UPPER', 'LOWER',
+                'LEN', 'SUB', 'INSTRING', 'FORMAT', 'DEFORMAT', 'MESSAGE', 'HALT',
+                'OPEN', 'CLOSE', 'CREATE', 'SET', 'NEXT', 'PREVIOUS', 'NOMEMO',
+                'STRING', 'LONG', 'SHORT', 'BYTE', 'REAL', 'DECIMAL', 'CSTRING',
+                'PSTRING', 'GROUP', 'QUEUE', 'FILE', 'RECORD', 'KEY', 'INDEX',
+                'WINDOW', 'APPLICATION', 'TOOLBAR', 'MENUBAR', 'MENU', 'ITEM',
+                'SHEET', 'TAB', 'OPTION', 'RADIO', 'CHECK', 'LIST', 'COMBO',
+                'ENTRY', 'TEXT', 'BUTTON', 'IMAGE', 'PROMPT', 'REGION',
+                'TRUE', 'FALSE', 'AND', 'OR', 'NOT', 'XOR', 'BAND', 'BOR', 'BXOR',
+                'COMPILE', 'OMIT', 'EQUATE', 'LIKE', 'OVER', 'AUTO', 'THREAD',
+                'BIND', 'UNBIND', 'REGISTER', 'UNREGISTER', 'EVENT', 'PROP'
+            ],
+            tokenizer: {
+                root: [
+                    [/!.*$/, 'comment'],
+                    [/'[^']*'/, 'string'],
+                    [/[a-zA-Z_]\w*/, { cases: { '@keywords': 'keyword', '@default': 'identifier' } }],
+                    [/[{}()\[\]]/, 'delimiter'],
+                    [/[0-9]+(\.[0-9]+)?/, 'number'],
+                    [/[,.:;=<>+\-*\/&|~^]/, 'operator'],
+                    [/\?[a-zA-Z_]\w*/, 'variable.predefined'],
+                ]
+            }
+        });
+
+        monaco.editor.defineTheme('clarion-dark', {
+            base: 'vs-dark',
+            inherit: true,
+            rules: [
+                { token: 'keyword', foreground: '89b4fa', fontStyle: 'bold' },
+                { token: 'comment', foreground: '6c7086', fontStyle: 'italic' },
+                { token: 'string', foreground: 'a6e3a1' },
+                { token: 'number', foreground: 'fab387' },
+                { token: 'variable.predefined', foreground: 'f5c2e7' },
+                { token: 'operator', foreground: '94e2d5' },
+            ],
+            colors: {
+                'editor.background': '#1e1e2e',
+                'editor.foreground': '#cdd6f4',
+                'editorLineNumber.foreground': '#a6adc8',
+                'editorLineNumber.activeForeground': '#cdd6f4',
+                'editor.selectionBackground': '#45475a',
+                'diffEditor.insertedTextBackground': '#a6e3a140',
+                'diffEditor.removedTextBackground': '#f3899940',
+                'diffEditor.insertedLineBackground': '#a6e3a125',
+                'diffEditor.removedLineBackground': '#f3899925',
+                'diffEditorGutter.insertedLineBackground': '#a6e3a130',
+                'diffEditorGutter.removedLineBackground': '#f3899930',
+                'editorGutter.background': '#181825',
+            }
+        });
+
+        monaco.editor.defineTheme('clarion-light', {
+            base: 'vs',
+            inherit: true,
+            rules: [
+                { token: 'keyword', foreground: '1e66f5', fontStyle: 'bold' },
+                { token: 'comment', foreground: '8c8fa1', fontStyle: 'italic' },
+                { token: 'string', foreground: '40a02b' },
+                { token: 'number', foreground: 'fe640b' },
+                { token: 'variable.predefined', foreground: 'ea76cb' },
+                { token: 'operator', foreground: '179299' },
+            ],
+            colors: {
+                'editor.background': '#eff1f5',
+                'editor.foreground': '#4c4f69',
+                'editorLineNumber.foreground': '#6c6f85',
+                'editorLineNumber.activeForeground': '#4c4f69',
+                'editor.selectionBackground': '#acb0be',
+                'diffEditor.insertedTextBackground': '#40a02b40',
+                'diffEditor.removedTextBackground': '#d2042d40',
+                'diffEditor.insertedLineBackground': '#40a02b25',
+                'diffEditor.removedLineBackground': '#d2042d25',
+                'diffEditorGutter.insertedLineBackground': '#40a02b30',
+                'diffEditorGutter.removedLineBackground': '#d2042d30',
+                'editorGutter.background': '#dce0e8',
+            }
+        });
+    }
+
+    // Normalize whitespace: collapse runs of spaces/tabs to single space, trim each line
+    function normalizeWhitespace(text) {
+        return text.split('\n').map(function(line) {
+            return line.replace(/[ \t]+/g, ' ').trim();
+        }).join('\n');
+    }
+
+    function createDiffEditor(original, modified, language) {
+        // Store raw texts for toggling and Apply
+        rawOriginal = original;
+        rawModified = modified;
+
+        var container = document.getElementById('editor-container');
+        container.innerHTML = '';
+
+        // When ignoring whitespace, normalize text so internal spacing diffs disappear
+        var displayOriginal = ignoreWhitespace ? normalizeWhitespace(original) : original;
+        var displayModified = ignoreWhitespace ? normalizeWhitespace(modified) : modified;
+
+        diffEditor = monaco.editor.createDiffEditor(container, {
+            theme: 'clarion-dark',
+            automaticLayout: true,
+            renderSideBySide: !isInline,
+            readOnly: false,
+            originalEditable: false,
+            fontSize: savedFontSize,
+            fontFamily: savedFontFamily,
+            lineNumbers: 'on',
+            lineNumbersMinChars: 4,
+            glyphMargin: false,
+            folding: false,
+            minimap: { enabled: false },
+            scrollBeyondLastLine: false,
+            renderWhitespace: 'selection',
+            wordWrap: 'off',
+            ignoreTrimWhitespace: ignoreWhitespace,
+            renderIndicators: true,
+            renderMarginRevertIcon: true,
+            mouseWheelZoom: true,
+        });
+
+        var lang = language || 'clarion';
+        var originalModel = monaco.editor.createModel(displayOriginal, lang);
+        var modifiedModel = monaco.editor.createModel(displayModified, lang);
+
+        diffEditor.setModel({
+            original: originalModel,
+            modified: modifiedModel
+        });
+
+        // Persist font size on Ctrl+wheel zoom and sync the input
+        diffEditor.getModifiedEditor().onDidChangeConfiguration(function(e) {
+            if (e.hasChanged(monaco.editor.EditorOption.fontSize)) {
+                var newSize = diffEditor.getModifiedEditor().getOption(monaco.editor.EditorOption.fontSize);
+                savedFontSize = newSize;
+                fontInput.value = newSize;
+                localStorage.setItem('diffViewerFontSize', newSize);
+            }
+        });
+
+        // Hook up diff navigation once diff computation completes
+        if (diffEditor.onDidUpdateDiff) {
+            diffEditor.onDidUpdateDiff(function() {
+                refreshDiffChanges();
+            });
+        }
+        // Also refresh after a short delay as fallback
+        setTimeout(refreshDiffChanges, 500);
+    }
+
+    // ---------- Diff Navigation (hunk-based) ----------
+
+    var diffHunks = []; // grouped change blocks
+    var savedFontSize = parseInt(localStorage.getItem('diffViewerFontSize')) || 13;
+    var savedFontFamily = localStorage.getItem('diffViewerFontFamily') || "'Cascadia Code', 'Consolas', 'Courier New', monospace";
+
+    // Merge adjacent line changes within `proximity` lines into logical hunks
+    function groupIntoHunks(changes, proximity) {
+        if (!changes || changes.length === 0) return [];
+        proximity = proximity || 3;
+        var hunks = [];
+        var cur = {
+            modStart: changes[0].modifiedStartLineNumber,
+            modEnd:   changes[0].modifiedEndLineNumber,
+            origStart: changes[0].originalStartLineNumber,
+            origEnd:   changes[0].originalEndLineNumber
+        };
+
+        for (var i = 1; i < changes.length; i++) {
+            var c = changes[i];
+            var nextStart = c.modifiedStartLineNumber > 0 ? c.modifiedStartLineNumber : c.originalStartLineNumber;
+            var curEnd    = cur.modEnd > 0 ? cur.modEnd : cur.origEnd;
+
+            if (nextStart <= curEnd + proximity) {
+                // Merge into current hunk
+                cur.modEnd  = Math.max(cur.modEnd,  c.modifiedEndLineNumber);
+                cur.origEnd = Math.max(cur.origEnd, c.originalEndLineNumber);
+            } else {
+                hunks.push(cur);
+                cur = {
+                    modStart: c.modifiedStartLineNumber,
+                    modEnd:   c.modifiedEndLineNumber,
+                    origStart: c.originalStartLineNumber,
+                    origEnd:   c.originalEndLineNumber
+                };
+            }
+        }
+        hunks.push(cur);
+        return hunks;
+    }
+
+    function refreshDiffChanges() {
+        if (!diffEditor) return;
+        var changes = diffEditor.getLineChanges();
+        if (!changes) return;
+        diffChanges = changes;
+        diffHunks = groupIntoHunks(changes, 3);
+        currentDiffIndex = -1;
+        var hasDiffs = diffHunks.length > 0;
+        document.getElementById('btn-prev').disabled = !hasDiffs;
+        document.getElementById('btn-next').disabled = !hasDiffs;
+        updateDiffCounter();
+        // Auto-jump to first hunk
+        if (hasDiffs && currentDiffIndex < 0) {
+            goToNextDiff();
+        }
+    }
+
+    function goToNextDiff() {
+        if (!diffEditor || diffHunks.length === 0) return;
+        currentDiffIndex = (currentDiffIndex + 1) % diffHunks.length;
+        jumpToHunk(currentDiffIndex);
+    }
+
+    function goToPrevDiff() {
+        if (!diffEditor || diffHunks.length === 0) return;
+        currentDiffIndex = (currentDiffIndex - 1 + diffHunks.length) % diffHunks.length;
+        jumpToHunk(currentDiffIndex);
+    }
+
+    function jumpToHunk(index) {
+        var hunk = diffHunks[index];
+        var line = hunk.modStart > 0 ? hunk.modStart : hunk.origStart;
+        var modEditor = diffEditor.getModifiedEditor();
+        modEditor.revealLineInCenter(line);
+        modEditor.setPosition({ lineNumber: line, column: 1 });
+        modEditor.focus();
+        updateDiffCounter();
+    }
+
+    function updateDiffCounter() {
+        var el = document.getElementById('diff-counter');
+        if (diffHunks.length === 0) {
+            el.textContent = 'No changes';
+        } else if (currentDiffIndex < 0) {
+            el.textContent = diffHunks.length + ' changes';
+        } else {
+            el.textContent = (currentDiffIndex + 1) + ' of ' + diffHunks.length;
+        }
+    }
+
+    // --- Font family select ---
+    var fontFamilySelect = document.getElementById('font-family-select');
+    // Restore saved selection
+    for (var i = 0; i < fontFamilySelect.options.length; i++) {
+        if (fontFamilySelect.options[i].value === savedFontFamily) {
+            fontFamilySelect.selectedIndex = i;
+            break;
+        }
+    }
+    fontFamilySelect.addEventListener('change', function() {
+        savedFontFamily = this.value;
+        localStorage.setItem('diffViewerFontFamily', savedFontFamily);
+        if (diffEditor) diffEditor.updateOptions({ fontFamily: savedFontFamily });
+    });
+
+    // --- Font size input ---
+    var fontInput = document.getElementById('font-size-input');
+    fontInput.value = savedFontSize;
+
+    function applyFontSize(size) {
+        size = Math.max(8, Math.min(40, parseInt(size) || 13));
+        savedFontSize = size;
+        fontInput.value = size;
+        localStorage.setItem('diffViewerFontSize', size);
+        if (diffEditor) diffEditor.updateOptions({ fontSize: size });
+    }
+
+    fontInput.addEventListener('change', function() { applyFontSize(this.value); });
+    fontInput.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); applyFontSize(this.value); this.blur(); }
+    });
+
+    // Ctrl+MouseWheel zoom — handle manually since WebView2 may block the event from Monaco
+    document.addEventListener('wheel', function(e) {
+        if (!e.ctrlKey || !diffEditor) return;
+        e.preventDefault();
+        var delta = e.deltaY > 0 ? -1 : 1;
+        applyFontSize(savedFontSize + delta);
+    }, { passive: false });
+
+    // Keyboard shortcuts: F7 = next diff, Shift+F7 = prev diff
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'F7' || e.keyCode === 118) {
+            e.preventDefault();
+            if (e.shiftKey) { goToPrevDiff(); } else { goToNextDiff(); }
+        }
+    });
+
+    function toggleInline() {
+        if (!diffEditor) return;
+        isInline = !isInline;
+        diffEditor.updateOptions({ renderSideBySide: !isInline });
+        document.getElementById('btn-inline').textContent = isInline ? 'Side by Side' : 'Inline';
+        // Re-check diffs after layout change
+        setTimeout(refreshDiffChanges, 300);
+    }
+
+    function toggleWhitespace() {
+        if (!diffEditor) return;
+        ignoreWhitespace = !ignoreWhitespace;
+        var btn = document.getElementById('btn-whitespace');
+        btn.classList.toggle('active', ignoreWhitespace);
+        btn.textContent = ignoreWhitespace ? 'Show WS' : 'Ignore WS';
+
+        // Swap models between normalized and raw text
+        var displayOriginal = ignoreWhitespace ? normalizeWhitespace(rawOriginal) : rawOriginal;
+        var displayModified = ignoreWhitespace ? normalizeWhitespace(rawModified) : rawModified;
+        var lang = diffEditor.getModel().original.getLanguageId();
+        var oldModel = diffEditor.getModel();
+        var originalModel = monaco.editor.createModel(displayOriginal, lang);
+        var modifiedModel = monaco.editor.createModel(displayModified, lang);
+        diffEditor.setModel({ original: originalModel, modified: modifiedModel });
+        diffEditor.updateOptions({ ignoreTrimWhitespace: ignoreWhitespace });
+        if (oldModel.original) oldModel.original.dispose();
+        if (oldModel.modified) oldModel.modified.dispose();
+        setTimeout(refreshDiffChanges, 300);
+    }
+
+    function toggleTheme() {
+        isDark = !isDark;
+        document.body.classList.toggle('light', !isDark);
+        document.getElementById('btn-theme').innerHTML = isDark ? '&#9790;' : '&#9728;';
+        if (diffEditor) {
+            monaco.editor.setTheme(isDark ? 'clarion-dark' : 'clarion-light');
+        }
+    }
+
+    function onApply() {
+        if (!diffEditor) return;
+        // If whitespace-normalized, return the raw modified text (user edits on normalized view are lost)
+        // If not normalized, return the editor content (which may include user edits)
+        var modifiedText = ignoreWhitespace
+            ? rawModified
+            : diffEditor.getModel().modified.getValue();
+        window.chrome.webview.postMessage(JSON.stringify({
+            action: 'apply',
+            text: modifiedText
+        }));
+    }
+
+    function onCancel() {
+        window.chrome.webview.postMessage(JSON.stringify({
+            action: 'cancel'
+        }));
+    }
+
+    function notifyReady() {
+        window.chrome.webview.postMessage(JSON.stringify({ action: 'ready' }));
+    }
+
+    // Receive messages from C# (PostWebMessageAsJson delivers e.data as parsed object)
+    window.chrome.webview.addEventListener('message', function(e) {
+        var msg = (typeof e.data === 'string') ? JSON.parse(e.data) : e.data;
+        if (msg.type === 'setDiff') {
+            document.getElementById('diff-name').textContent = msg.title || 'Untitled';
+            if (msg.ignoreWhitespace !== undefined) {
+                ignoreWhitespace = !!msg.ignoreWhitespace;
+                var btn = document.getElementById('btn-whitespace');
+                btn.classList.toggle('active', ignoreWhitespace);
+                btn.textContent = ignoreWhitespace ? 'Show WS' : 'Ignore WS';
+            }
+
+            // Fetch content from temp files via virtual host (avoids large message corruption)
+            if (msg.originalUrl && msg.modifiedUrl) {
+                Promise.all([
+                    fetch(msg.originalUrl).then(function(r) { return r.text(); }),
+                    fetch(msg.modifiedUrl).then(function(r) { return r.text(); })
+                ]).then(function(texts) {
+                    console.log('[DiffViewer] fetched original lines: ' + texts[0].split('\n').length +
+                                ', modified lines: ' + texts[1].split('\n').length);
+                    createDiffEditor(texts[0], texts[1], msg.language);
+                }).catch(function(err) {
+                    console.error('[DiffViewer] fetch failed: ' + err);
+                    // Fallback to inline text if available
+                    createDiffEditor(msg.original || '', msg.modified || '', msg.language);
+                });
+            } else {
+                // Inline text fallback for small payloads
+                console.log('[DiffViewer] inline original lines: ' + (msg.original || '').split('\n').length +
+                            ', modified lines: ' + (msg.modified || '').split('\n').length);
+                createDiffEditor(msg.original || '', msg.modified || '', msg.language);
+            }
+        }
+    });
+</script>
+</body>
+</html>

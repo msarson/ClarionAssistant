@@ -7,7 +7,6 @@ using System.Text;
 using System.Windows.Forms;
 using ClarionAssistant.Dialogs;
 using ClarionAssistant.Services;
-using ClarionAssistant.TaskLifecycleBoard;
 using ClarionAssistant.Terminal;
 
 namespace ClarionAssistant
@@ -17,18 +16,9 @@ namespace ClarionAssistant
         private WebViewTerminalRenderer _renderer;
         private ConPtyTerminal _terminal;
 
-        // Solution bar controls
-        private Panel _solutionBar;
-        private ComboBox _versionCombo;
-        private ComboBox _solutionCombo;
-        private Button _browseSolutionButton;
-        private Button _fullIndexButton;
-        private Button _updateIndexButton;
-        private Label _indexStatusLabel;
-
-        // Toolbar controls
-        private ToolStrip _toolbar;
-        private ToolStripLabel _statusLabel;
+        // Header (WebView2)
+        private HeaderWebView _header;
+        private Splitter _splitter;
 
         private McpServer _mcpServer;
         private McpToolRegistry _toolRegistry;
@@ -38,14 +28,16 @@ namespace ClarionAssistant
 
         private string _mcpConfigPath;
         private bool _claudeLaunched;
-        private MultiTerminalApiClient _multiTerminalApi;
         private string _currentSlnPath;
         private string _indexerPath;
         private ClarionVersionInfo _versionInfo;
         private ClarionVersionConfig _currentVersionConfig;
+        private RedFileService _redFileService;
+        private DiffService _diffService;
 
         public string CurrentSolutionPath { get { return _currentSlnPath; } }
         public ClarionVersionConfig CurrentVersionConfig { get { return _currentVersionConfig; } }
+        public RedFileService RedFile { get { return _redFileService; } }
         public string CurrentDbPath
         {
             get
@@ -71,153 +63,27 @@ namespace ClarionAssistant
         {
             SuspendLayout();
 
-            // === Solution Bar (top panel) ===
-            _solutionBar = new Panel
+            // === Header (WebView2) ===
+            _header = new HeaderWebView();
+            _header.ActionReceived += OnHeaderAction;
+            _header.HeaderReady += OnHeaderReady;
+
+            // Restore saved header height
+            int savedHeight;
+            string heightStr = _settings.Get("Header.Height");
+            if (!string.IsNullOrEmpty(heightStr) && int.TryParse(heightStr, out savedHeight))
+                _header.Height = Math.Max(60, Math.Min(400, savedHeight));
+
+            // === Splitter between header and terminal ===
+            _splitter = new Splitter
             {
                 Dock = DockStyle.Top,
-                Height = 62,
-                BackColor = Color.FromArgb(40, 40, 40),
-                Padding = new Padding(6, 4, 6, 4)
+                Height = 4,
+                BackColor = Color.FromArgb(49, 50, 68),
+                MinSize = 60,
+                Cursor = Cursors.SizeNS
             };
-
-            // Row 1: Version
-            var versionLabel = new Label
-            {
-                Text = "Version",
-                ForeColor = Color.FromArgb(180, 180, 180),
-                Location = new Point(6, 7),
-                AutoSize = true,
-                Font = new Font("Segoe UI", 8f)
-            };
-            _versionCombo = new ComboBox
-            {
-                Location = new Point(60, 4),
-                Width = 350,
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.FromArgb(55, 55, 55),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 8f)
-            };
-
-            // Row 2: Solution + buttons
-            var solutionLabel = new Label
-            {
-                Text = "Solution",
-                ForeColor = Color.FromArgb(180, 180, 180),
-                Location = new Point(6, 35),
-                AutoSize = true,
-                Font = new Font("Segoe UI", 8f)
-            };
-            _solutionCombo = new ComboBox
-            {
-                Location = new Point(60, 32),
-                Width = 350,
-                DropDownStyle = ComboBoxStyle.DropDown,
-                BackColor = Color.FromArgb(55, 55, 55),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 8f)
-            };
-            _solutionCombo.SelectedIndexChanged += OnSolutionChanged;
-
-            _browseSolutionButton = new Button
-            {
-                Text = "...",
-                Location = new Point(414, 31),
-                Width = 30,
-                Height = 22,
-                FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(60, 60, 60),
-                ForeColor = Color.White,
-                Font = new Font("Segoe UI", 8f)
-            };
-            _browseSolutionButton.Click += OnBrowseSolution;
-
-            _fullIndexButton = new Button
-            {
-                Text = "Full Index",
-                Location = new Point(450, 31),
-                Width = 70,
-                Height = 22,
-                FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(0, 100, 180),
-                ForeColor = Color.White,
-                Font = new Font("Segoe UI", 8f, FontStyle.Bold)
-            };
-            _fullIndexButton.Click += (s, e) => RunIndex(false);
-
-            _updateIndexButton = new Button
-            {
-                Text = "Update",
-                Location = new Point(524, 31),
-                Width = 60,
-                Height = 22,
-                FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(60, 60, 60),
-                ForeColor = Color.White,
-                Font = new Font("Segoe UI", 8f)
-            };
-            _updateIndexButton.Click += (s, e) => RunIndex(true);
-
-            var refreshButton = new Button
-            {
-                Text = "\u21BB",
-                Location = new Point(588, 4),
-                Width = 26,
-                Height = 22,
-                FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(60, 60, 60),
-                ForeColor = Color.White,
-                Font = new Font("Segoe UI", 10f),
-                Tag = "refresh"
-            };
-            refreshButton.FlatAppearance.BorderSize = 0;
-            refreshButton.Click += (s, e) => DetectFromIde();
-
-            _indexStatusLabel = new Label
-            {
-                Text = "",
-                ForeColor = Color.FromArgb(120, 200, 120),
-                Location = new Point(590, 35),
-                AutoSize = true,
-                Font = new Font("Segoe UI", 8f)
-            };
-
-            _solutionBar.Controls.AddRange(new Control[]
-            {
-                versionLabel, _versionCombo, refreshButton,
-                solutionLabel, _solutionCombo, _browseSolutionButton,
-                _fullIndexButton, _updateIndexButton, _indexStatusLabel
-            });
-
-            // === Toolbar ===
-            _toolbar = new ToolStrip
-            {
-                GripStyle = ToolStripGripStyle.Hidden,
-                Dock = DockStyle.Top,
-                BackColor = Color.FromArgb(30, 30, 30),
-                ForeColor = Color.White,
-                Renderer = new DarkToolStripRenderer()
-            };
-
-            var newChatButton = new ToolStripButton("New Chat") { ForeColor = Color.White, ToolTipText = "Stop current session and start fresh" };
-            newChatButton.Click += OnNewChat;
-
-            var settingsButton = new ToolStripButton("Settings") { ForeColor = Color.White, ToolTipText = "Terminal and Claude settings" };
-            settingsButton.Click += OnSettings;
-
-            var createComButton = new ToolStripButton("Create COM") { ForeColor = Color.FromArgb(100, 200, 255), ToolTipText = "Create a new COM control for Clarion" };
-            createComButton.Click += OnCreateCom;
-
-            _statusLabel = new ToolStripLabel("Starting...") { Alignment = ToolStripItemAlignment.Right, ForeColor = Color.Gray };
-
-            _toolbar.Items.Add(newChatButton);
-            _toolbar.Items.Add(new ToolStripSeparator());
-            _toolbar.Items.Add(settingsButton);
-            _toolbar.Items.Add(new ToolStripSeparator());
-            _toolbar.Items.Add(createComButton);
-            _toolbar.Items.Add(_statusLabel);
+            _splitter.SplitterMoved += OnSplitterMoved;
 
             // === Terminal renderer ===
             _renderer = new WebViewTerminalRenderer { Dock = DockStyle.Fill };
@@ -227,36 +93,45 @@ namespace ClarionAssistant
 
             // Add in correct order (bottom to top for docking)
             Controls.Add(_renderer);
-            Controls.Add(_toolbar);
-            Controls.Add(_solutionBar);
+            Controls.Add(_splitter);
+            Controls.Add(_header);
 
             BackColor = Color.FromArgb(12, 12, 12);
-
-            // Handle resize to reflow solution bar
-            _solutionBar.Resize += (s, e) => ReflowSolutionBar();
 
             ResumeLayout(false);
         }
 
-        private void ReflowSolutionBar()
+        private void OnHeaderReady(object sender, EventArgs e)
         {
-            int w = _solutionBar.ClientSize.Width;
-            int comboW = Math.Max(150, w - 290);
+            LoadVersions();
+            LoadSolutionHistory();
+            SyncHeaderFontSettings();
+        }
 
-            _versionCombo.Width = comboW;
+        private void SyncHeaderFontSettings()
+        {
+            string family = GetFontFamily();
+            int size = (int)Math.Round(GetFontSize());
+            _header.SendMessage("{\"type\":\"setFontFamily\",\"value\":\"" + HeaderWebView.EscapeJsonStatic(family) + "\"}");
+            _header.SendMessage("{\"type\":\"setFontSize\",\"value\":\"" + size + "\"}");
+        }
 
-            // Position refresh button after version combo
-            foreach (Control c in _solutionBar.Controls)
+        private void OnHeaderAction(object sender, HeaderActionEventArgs e)
+        {
+            switch (e.Action)
             {
-                if (c.Tag as string == "refresh")
-                    c.Left = 60 + comboW + 4;
+                case "newChat": OnNewChat(sender, EventArgs.Empty); break;
+                case "settings": OnSettings(sender, EventArgs.Empty); break;
+                case "createCom": OnCreateCom(sender, EventArgs.Empty); break;
+                case "refresh": DetectFromIde(); break;
+                case "browse": OnBrowseSolution(sender, EventArgs.Empty); break;
+                case "fullIndex": RunIndex(false); break;
+                case "updateIndex": RunIndex(true); break;
+                case "versionChanged": OnVersionChanged(e.Data); break;
+                case "solutionChanged": OnSolutionChanged(e.Data); break;
+                case "fontFamilyChanged": OnFontFamilyChanged(e.Data); break;
+                case "fontSizeChanged": OnFontSizeChangedFromHeader(e.Data); break;
             }
-
-            _solutionCombo.Width = comboW;
-            _browseSolutionButton.Left = 60 + comboW + 4;
-            _fullIndexButton.Left = _browseSolutionButton.Right + 4;
-            _updateIndexButton.Left = _fullIndexButton.Right + 4;
-            _indexStatusLabel.Left = _updateIndexButton.Right + 8;
         }
 
         #endregion
@@ -265,60 +140,84 @@ namespace ClarionAssistant
 
         private void LoadVersions()
         {
-            _versionCombo.Items.Clear();
             _versionInfo = ClarionVersionService.Detect();
 
             if (_versionInfo == null || _versionInfo.Versions.Count == 0)
             {
-                _versionCombo.Items.Add("(not detected)");
-                _versionCombo.SelectedIndex = 0;
+                _header.SetVersions(new[] { "(not detected)" }, new[] { "" }, 0);
                 return;
             }
 
             _currentVersionConfig = _versionInfo.GetCurrentConfig();
 
-            foreach (var config in _versionInfo.Versions)
+            var labels = new System.Collections.Generic.List<string>();
+            var values = new System.Collections.Generic.List<string>();
+            int selectedIdx = 0;
+
+            for (int i = 0; i < _versionInfo.Versions.Count; i++)
             {
+                var config = _versionInfo.Versions[i];
                 string label = config.Name;
-                // Mark the resolved current version
                 if (_currentVersionConfig != null && config.Name == _currentVersionConfig.Name
                     && _versionInfo.CurrentVersionName != null
                     && _versionInfo.CurrentVersionName.IndexOf("Current", StringComparison.OrdinalIgnoreCase) >= 0)
                     label += " (active)";
 
-                _versionCombo.Items.Add(label);
+                labels.Add(label);
+                values.Add(config.Name);
                 if (_currentVersionConfig != null && config.Name == _currentVersionConfig.Name)
-                    _versionCombo.SelectedIndex = _versionCombo.Items.Count - 1;
+                    selectedIdx = i;
             }
 
-            if (_versionCombo.SelectedIndex < 0 && _versionCombo.Items.Count > 0)
-                _versionCombo.SelectedIndex = 0;
+            _header.SetVersions(labels.ToArray(), values.ToArray(), selectedIdx);
+        }
 
-            _versionCombo.SelectedIndexChanged += (s, e) =>
+        private void OnVersionChanged(string value)
+        {
+            if (_versionInfo != null && !string.IsNullOrEmpty(value))
             {
-                string selected = _versionCombo.SelectedItem?.ToString();
-                if (_versionInfo != null && !string.IsNullOrEmpty(selected))
-                    _currentVersionConfig = _versionInfo.Versions.Find(v => v.Name == selected);
-            };
+                _currentVersionConfig = _versionInfo.Versions.Find(v => v.Name == value);
+                LoadRedFile();
+            }
+        }
+
+        private void LoadRedFile()
+        {
+            _redFileService = new RedFileService();
+            if (_currentVersionConfig == null) return;
+
+            string projectDir = null;
+            if (!string.IsNullOrEmpty(_currentSlnPath))
+                projectDir = Path.GetDirectoryName(_currentSlnPath);
+
+            _redFileService.LoadForProject(projectDir, _currentVersionConfig);
         }
 
         private void LoadSolutionHistory()
         {
             string history = _settings.Get("SolutionHistory") ?? "";
-            _solutionCombo.Items.Clear();
+            var paths = new System.Collections.Generic.List<string>();
             foreach (string path in history.Split('|'))
             {
                 if (!string.IsNullOrEmpty(path) && File.Exists(path))
-                    _solutionCombo.Items.Add(path);
+                    paths.Add(path);
             }
 
             string last = _settings.Get("LastSolutionPath");
+            int selectedIdx = -1;
             if (!string.IsNullOrEmpty(last) && File.Exists(last))
             {
-                _solutionCombo.Text = last;
+                selectedIdx = paths.IndexOf(last);
+                if (selectedIdx < 0)
+                {
+                    paths.Insert(0, last);
+                    selectedIdx = 0;
+                }
                 _currentSlnPath = last;
-                UpdateIndexStatus();
             }
+
+            _header.SetSolutions(paths.ToArray(), selectedIdx);
+            UpdateIndexStatus();
         }
 
         private void AddToSolutionHistory(string path)
@@ -344,23 +243,23 @@ namespace ClarionAssistant
             if (!string.IsNullOrEmpty(slnPath) && File.Exists(slnPath))
             {
                 _currentSlnPath = slnPath;
-                _solutionCombo.Text = slnPath;
                 AddToSolutionHistory(slnPath);
-                UpdateIndexStatus();
+                LoadSolutionHistory();
             }
 
             // Always re-detect version (user may have changed build in IDE)
             LoadVersions();
+            LoadRedFile();
         }
 
-        private void OnSolutionChanged(object sender, EventArgs e)
+        private void OnSolutionChanged(string path)
         {
-            string path = _solutionCombo.Text;
             if (!string.IsNullOrEmpty(path) && File.Exists(path))
             {
                 _currentSlnPath = path;
                 AddToSolutionHistory(path);
                 UpdateIndexStatus();
+                LoadRedFile();
             }
         }
 
@@ -376,27 +275,24 @@ namespace ClarionAssistant
                 if (dlg.ShowDialog() == DialogResult.OK)
                 {
                     _currentSlnPath = dlg.FileName;
-                    _solutionCombo.Text = dlg.FileName;
                     AddToSolutionHistory(dlg.FileName);
                     LoadSolutionHistory();
-                    UpdateIndexStatus();
                 }
             }
         }
 
         private void UpdateIndexStatus()
         {
+            if (!_header.IsReady) return;
             string dbPath = CurrentDbPath;
             if (!string.IsNullOrEmpty(dbPath) && File.Exists(dbPath))
             {
                 var fi = new FileInfo(dbPath);
-                _indexStatusLabel.Text = "Indexed: " + fi.LastWriteTime.ToString("MMM d HH:mm");
-                _indexStatusLabel.ForeColor = Color.FromArgb(120, 200, 120);
+                _header.SetIndexStatus("Indexed: " + fi.LastWriteTime.ToString("MMM d HH:mm"));
             }
             else
             {
-                _indexStatusLabel.Text = "Not indexed";
-                _indexStatusLabel.ForeColor = Color.FromArgb(200, 150, 80);
+                _header.SetIndexStatus("Not indexed", "warning");
             }
         }
 
@@ -418,16 +314,29 @@ namespace ClarionAssistant
                 return;
             }
 
-            _fullIndexButton.Enabled = false;
-            _updateIndexButton.Enabled = false;
-            _indexStatusLabel.Text = incremental ? "Updating..." : "Indexing...";
-            _indexStatusLabel.ForeColor = Color.FromArgb(100, 180, 255);
+            _header.SetIndexButtonsEnabled(false);
+            _header.SetIndexStatus(incremental ? "Updating..." : "Indexing...", "active");
+
+            // Build library paths from RED file .inc search paths
+            string libPathsArg = null;
+            if (_redFileService != null)
+            {
+                var incPaths = _redFileService.GetSearchPaths(".inc");
+                if (incPaths.Count > 0)
+                    libPathsArg = string.Join(";", incPaths);
+            }
 
             var worker = new BackgroundWorker();
             worker.DoWork += (s, e) =>
             {
-                string args = $"\"{_currentSlnPath}\"";
+                string args = $"index \"{_currentSlnPath}\"";
                 if (incremental) args += " --incremental";
+                if (!string.IsNullOrEmpty(libPathsArg))
+                {
+                    // Escape double-quotes in paths to prevent argument injection
+                    string safePaths = libPathsArg.Replace("\"", "\\\"");
+                    args += $" --lib-paths \"{safePaths}\"";
+                }
 
                 var psi = new ProcessStartInfo
                 {
@@ -435,25 +344,30 @@ namespace ClarionAssistant
                     Arguments = args,
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
-                    RedirectStandardError = true,
+                    RedirectStandardError = false,
                     CreateNoWindow = true
                 };
 
-                var proc = Process.Start(psi);
-                e.Result = proc.StandardOutput.ReadToEnd();
-                proc.WaitForExit(300000); // 5 min max
+                using (var proc = Process.Start(psi))
+                {
+                    // Read stdout asynchronously so WaitForExit timeout is effective
+                    var readTask = System.Threading.Tasks.Task.Run(
+                        () => proc.StandardOutput.ReadToEnd());
+                    bool exited = proc.WaitForExit(300000); // 5 min max
+                    if (!exited)
+                    {
+                        try { proc.Kill(); } catch { }
+                    }
+                    e.Result = readTask.Wait(5000) ? readTask.Result : "";
+                }
             };
             worker.RunWorkerCompleted += (s, e) =>
             {
-                _fullIndexButton.Enabled = true;
-                _updateIndexButton.Enabled = true;
+                _header.SetIndexButtonsEnabled(true);
                 UpdateIndexStatus();
 
                 if (e.Error != null)
-                {
-                    _indexStatusLabel.Text = "Error: " + e.Error.Message;
-                    _indexStatusLabel.ForeColor = Color.FromArgb(255, 100, 100);
-                }
+                    _header.SetIndexStatus("Error: " + e.Error.Message, "error");
             };
             worker.RunWorkerAsync();
         }
@@ -480,6 +394,27 @@ namespace ClarionAssistant
 
         #region Settings
 
+        private void OnSplitterMoved(object sender, SplitterEventArgs e)
+        {
+            _settings.Set("Header.Height", _header.Height.ToString());
+        }
+
+        private void OnFontFamilyChanged(string family)
+        {
+            if (string.IsNullOrEmpty(family)) return;
+            _settings.Set("Claude.FontFamily", family);
+            _renderer.SetFontFamily(family);
+        }
+
+        private void OnFontSizeChangedFromHeader(string sizeStr)
+        {
+            float size;
+            if (!float.TryParse(sizeStr, out size)) return;
+            size = Math.Max(6f, Math.Min(32f, size));
+            _settings.Set("Claude.FontSize", size.ToString());
+            _renderer.SetFontSize(size);
+        }
+
         private float GetFontSize()
         {
             string val = _settings.Get("Claude.FontSize");
@@ -487,6 +422,12 @@ namespace ClarionAssistant
             if (!string.IsNullOrEmpty(val) && float.TryParse(val, out size))
                 return Math.Max(6f, Math.Min(32f, size));
             return 14f;
+        }
+
+        private string GetFontFamily()
+        {
+            string val = _settings.Get("Claude.FontFamily");
+            return string.IsNullOrEmpty(val) ? "Cascadia Mono" : val;
         }
 
         private string GetWorkingDirectory()
@@ -546,6 +487,10 @@ namespace ClarionAssistant
             // Give the tool registry a reference back so it can access solution context and run indexing
             _toolRegistry.SetChatControl(this);
 
+            // Set up diff viewer service
+            _diffService = new DiffService();
+            _toolRegistry.SetDiffService(_diffService);
+
             _mcpServer.SetToolRegistry(_toolRegistry);
 
             _mcpServer.OnStatusChanged += (running, port) =>
@@ -584,11 +529,24 @@ namespace ClarionAssistant
         private void OnRendererInitialized(object sender, EventArgs e)
         {
             _renderer.SetFontSize(GetFontSize());
+            _renderer.SetFontFamily(GetFontFamily());
+
+            // Sync header dropdowns with saved font settings
+            _renderer.FontSizeChangedByUser += OnFontSizeChangedByWheel;
+
             LoadVersions();
             LoadSolutionHistory();
             DetectFromIde();
             StartMcpServer();
             LaunchClaude();
+        }
+
+        private void OnFontSizeChangedByWheel(object sender, float size)
+        {
+            _settings.Set("Claude.FontSize", size.ToString());
+            // Update header dropdown to match
+            int rounded = (int)Math.Round(size);
+            _header.SendMessage("{\"type\":\"setFontSize\",\"value\":\"" + rounded + "\"}");
         }
 
         private void LaunchClaude()
@@ -699,7 +657,10 @@ namespace ClarionAssistant
         private void UpdateStatus(string text)
         {
             if (InvokeRequired) { BeginInvoke((Action)(() => UpdateStatus(text))); return; }
-            _statusLabel.Text = text;
+            string css = "";
+            if (text.Contains("port")) css = "connected";
+            else if (text.Contains("failed") || text.Contains("exited")) css = "error";
+            _header.SetStatus(text, css);
         }
 
         #endregion
@@ -716,13 +677,4 @@ namespace ClarionAssistant
         }
     }
 
-    internal class DarkToolStripRenderer : ToolStripProfessionalRenderer
-    {
-        private static readonly SolidBrush _backgroundBrush = new SolidBrush(Color.FromArgb(30, 30, 30));
-
-        protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
-        {
-            e.Graphics.FillRectangle(_backgroundBrush, e.AffectedBounds);
-        }
-    }
 }
