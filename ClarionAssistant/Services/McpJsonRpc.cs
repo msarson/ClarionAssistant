@@ -123,7 +123,7 @@ namespace ClarionAssistant.Services
         {
             return new Dictionary<string, object>
             {
-                { "protocolVersion", "2024-11-05" },
+                { "protocolVersion", "2025-03-26" },
                 { "capabilities", new Dictionary<string, object>
                     {
                         { "tools", new Dictionary<string, object>() }

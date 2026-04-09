@@ -28,6 +28,10 @@ namespace ClarionAssistant.Services
         private readonly ConcurrentDictionary<string, SseClient> _sseClients =
             new ConcurrentDictionary<string, SseClient>();
 
+        // Streamable HTTP sessions keyed by session ID
+        private readonly ConcurrentDictionary<string, DateTime> _httpSessions =
+            new ConcurrentDictionary<string, DateTime>();
+
         public event Action<string, string> OnToolCall;
         public event Action<bool, int> OnStatusChanged;
         public event Action<string> OnError;
@@ -92,6 +96,7 @@ namespace ClarionAssistant.Services
                 try { kvp.Value.Close(); } catch { }
             }
             _sseClients.Clear();
+            _httpSessions.Clear();
 
             try { _listener.Stop(); } catch { }
             try { _listener.Close(); } catch { }
@@ -116,8 +121,8 @@ namespace ClarionAssistant.Services
             {
                 { "clarion-assistant", new Dictionary<string, object>
                     {
-                        { "type", "sse" },
-                        { "url", string.Format("http://localhost:{0}/sse", _port) },
+                        { "type", "http" },
+                        { "url", string.Format("http://localhost:{0}/mcp", _port) },
                         { "autoApprove", toolNames.ToArray() }
                     }
                 }
@@ -183,8 +188,9 @@ namespace ClarionAssistant.Services
 
                 // CORS headers
                 response.Headers.Add("Access-Control-Allow-Origin", "*");
-                response.Headers.Add("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-                response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
+                response.Headers.Add("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS");
+                response.Headers.Add("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id");
+                response.Headers.Add("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
                 if (request.HttpMethod == "OPTIONS")
                 {
@@ -193,14 +199,28 @@ namespace ClarionAssistant.Services
                     return;
                 }
 
-                // SSE endpoint — long-lived event stream
+                // Streamable HTTP endpoint — JSON-RPC request/response over POST
+                if (request.HttpMethod == "POST" && path == "/mcp")
+                {
+                    HandleStreamableHttpPost(context);
+                    return;
+                }
+
+                // Streamable HTTP session teardown
+                if (request.HttpMethod == "DELETE" && path == "/mcp")
+                {
+                    HandleStreamableHttpDelete(context);
+                    return;
+                }
+
+                // SSE endpoint — long-lived event stream (legacy)
                 if (request.HttpMethod == "GET" && path == "/sse")
                 {
                     HandleSseConnection(context);
                     return;
                 }
 
-                // Messages endpoint — JSON-RPC over POST, response via SSE
+                // Messages endpoint — JSON-RPC over POST, response via SSE (legacy)
                 if (request.HttpMethod == "POST" && path.StartsWith("/messages"))
                 {
                     HandleMessagePost(context);
@@ -332,6 +352,86 @@ namespace ClarionAssistant.Services
                     RaiseError("Async tool call error: " + ex.Message);
                 }
             });
+        }
+
+        #endregion
+
+        #region Streamable HTTP Transport
+
+        private void HandleStreamableHttpPost(HttpListenerContext context)
+        {
+            var request = context.Request;
+            var response = context.Response;
+
+            // Read JSON-RPC request body
+            string body;
+            using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
+            {
+                body = reader.ReadToEnd();
+            }
+
+            // Determine or create session
+            string sessionId = request.Headers["Mcp-Session-Id"];
+            bool isInitialize = body.Contains("\"method\":\"initialize\"");
+
+            if (isInitialize)
+            {
+                // New session
+                sessionId = Guid.NewGuid().ToString();
+                _httpSessions[sessionId] = DateTime.UtcNow;
+            }
+            else if (string.IsNullOrEmpty(sessionId) || !_httpSessions.ContainsKey(sessionId))
+            {
+                // Unknown session — require initialize first
+                response.StatusCode = 400;
+                byte[] err = Encoding.UTF8.GetBytes("{\"error\":\"missing or invalid Mcp-Session-Id\"}");
+                response.ContentType = "application/json";
+                response.ContentLength64 = err.Length;
+                response.OutputStream.Write(err, 0, err.Length);
+                response.Close();
+                return;
+            }
+
+            // Update last-seen timestamp
+            _httpSessions[sessionId] = DateTime.UtcNow;
+
+            // Process the JSON-RPC request
+            string responseJson = ProcessJsonRpc(body);
+
+            // Check if this is a notification (no id → no response expected)
+            bool isNotification = body.Contains("\"method\":\"notifications/");
+            if (isNotification)
+            {
+                response.StatusCode = 204;
+                response.Headers.Add("Mcp-Session-Id", sessionId);
+                response.Close();
+                return;
+            }
+
+            // Send JSON-RPC response directly
+            byte[] buffer = Encoding.UTF8.GetBytes(responseJson);
+            response.StatusCode = 200;
+            response.ContentType = "application/json";
+            response.ContentLength64 = buffer.Length;
+            response.Headers.Add("Mcp-Session-Id", sessionId);
+            response.OutputStream.Write(buffer, 0, buffer.Length);
+            response.Close();
+        }
+
+        private void HandleStreamableHttpDelete(HttpListenerContext context)
+        {
+            var request = context.Request;
+            var response = context.Response;
+
+            string sessionId = request.Headers["Mcp-Session-Id"];
+            if (!string.IsNullOrEmpty(sessionId))
+            {
+                DateTime removed;
+                _httpSessions.TryRemove(sessionId, out removed);
+            }
+
+            response.StatusCode = 204;
+            response.Close();
         }
 
         #endregion
