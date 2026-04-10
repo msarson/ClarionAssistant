@@ -236,6 +236,10 @@ Source: "{#SrcPlugin}\docs\*"; DestDir: "{%USERPROFILE}\.claude\plugins\marketpl
 ; --- Blank dictionary template ---
 Source: "{#SrcBlankDct}\blank.dct"; DestDir: "{userappdata}\clarionassistant"; Components: plugin\skills; Flags: ignoreversion
 
+; --- Default class model templates ---
+Source: "{#SrcBlankDct}\ClassModels\*.inc"; DestDir: "{userappdata}\clarionassistant\ClassModels"; Components: plugin\skills; Flags: onlyifdoesntexist
+Source: "{#SrcBlankDct}\ClassModels\*.clw"; DestDir: "{userappdata}\clarionassistant\ClassModels"; Components: plugin\skills; Flags: onlyifdoesntexist
+
 ; --- Claude Code Quality Agents ---
 Source: "{#SrcAgents}\code-reviewer.md"; DestDir: "{%USERPROFILE}\.claude\agents"; Components: agents; Flags: onlyifdoesntexist
 Source: "{#SrcAgents}\verifier.md"; DestDir: "{%USERPROFILE}\.claude\agents"; Components: agents; Flags: onlyifdoesntexist
