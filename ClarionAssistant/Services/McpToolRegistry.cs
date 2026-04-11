@@ -2052,6 +2052,28 @@ COMMON QUERIES:
                 }
             });
 
+            Register(new McpTool
+            {
+                Name = "lsp_debug_status",
+                Description = "Debug tool: reports LSP client state, received notification counts, diagnostics cache contents, " +
+                    "open documents, and the last lines of server stderr. Use this when lsp_diagnostics returns {pending:true} " +
+                    "unexpectedly to determine whether the server is publishing anything at all, or whether our cache is being " +
+                    "populated but not retrieved correctly. Returns null if the LSP client has never been started.",
+                InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>()),
+                RequiresUiThread = false,
+                Handler = args =>
+                {
+                    if (_lspClient == null)
+                        return new JavaScriptSerializer().Serialize(new Dictionary<string, object>
+                        {
+                            { "error", "LSP client has never been started. Call lsp_start first." }
+                        });
+
+                    var status = _lspClient.GetDebugStatus();
+                    return new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(status);
+                }
+            });
+
             // === Diff Viewer Tools ===
             Register(new McpTool
             {

@@ -36,6 +36,15 @@ namespace ClarionAssistant.Services
             new Dictionary<string, DiagnosticSet>(StringComparer.OrdinalIgnoreCase);
         private readonly object _diagnosticsLock = new object();
 
+        // Debug telemetry — populated by ReadLoop/stderr handler. Used by the
+        // lsp_debug_status tool to expose what the server is actually sending.
+        private readonly Dictionary<string, int> _notificationCounts =
+            new Dictionary<string, int>(StringComparer.Ordinal);
+        private readonly object _debugLock = new object();
+        private const int MaxStderrBuffer = 100;
+        private readonly Queue<string> _stderrBuffer = new Queue<string>();
+        private string _lastRawNotificationPreview;
+
         public bool IsRunning { get { return _running && _process != null && !_process.HasExited; } }
 
         /// <summary>
@@ -82,11 +91,17 @@ namespace ClarionAssistant.Services
                     }
                 };
 
-                // Capture stderr for diagnostics
+                // Capture stderr for diagnostics — ring buffer + Debug output
                 _process.ErrorDataReceived += (s, e) =>
                 {
-                    if (!string.IsNullOrEmpty(e.Data))
-                        System.Diagnostics.Debug.WriteLine("[LSP stderr] " + e.Data);
+                    if (string.IsNullOrEmpty(e.Data)) return;
+                    System.Diagnostics.Debug.WriteLine("[LSP stderr] " + e.Data);
+                    lock (_debugLock)
+                    {
+                        _stderrBuffer.Enqueue(e.Data);
+                        while (_stderrBuffer.Count > MaxStderrBuffer)
+                            _stderrBuffer.Dequeue();
+                    }
                 };
 
                 _process.Start();
@@ -346,6 +361,52 @@ namespace ClarionAssistant.Services
             }
 
             return WaitForDiagnostics(filePath, timeoutMs, forceRefresh: true);
+        }
+
+        /// <summary>
+        /// Returns a snapshot of debug telemetry for the lsp_debug_status tool:
+        /// process state, notification method counts, diagnostics cache state, and
+        /// the last N lines of server stderr. Used to debug why diagnostics aren't
+        /// arriving on a live server without needing DebugView access.
+        /// </summary>
+        public Dictionary<string, object> GetDebugStatus()
+        {
+            var result = new Dictionary<string, object>();
+            result["isRunning"] = IsRunning;
+            result["processId"] = _process != null && !_process.HasExited ? _process.Id : -1;
+
+            lock (_debugLock)
+            {
+                var counts = new Dictionary<string, object>();
+                foreach (var kv in _notificationCounts)
+                    counts[kv.Key] = kv.Value;
+                result["notificationCounts"] = counts;
+                result["lastNotificationPreview"] = _lastRawNotificationPreview ?? "(none yet)";
+                result["stderrTail"] = new List<string>(_stderrBuffer);
+            }
+
+            lock (_diagnosticsLock)
+            {
+                var cache = new List<Dictionary<string, object>>();
+                foreach (var kv in _diagnostics)
+                {
+                    cache.Add(new Dictionary<string, object>
+                    {
+                        { "uri", kv.Key },
+                        { "wasPublished", kv.Value.WasPublished },
+                        { "entryCount", kv.Value.Entries.Count }
+                    });
+                }
+                result["diagnosticsCache"] = cache;
+            }
+
+            // Currently-open documents (tracked by EnsureDocumentOpen / didChange)
+            var openDocs = new List<string>();
+            foreach (var kv in _openDocuments)
+                openDocs.Add(kv.Key);
+            result["openDocuments"] = openDocs;
+
+            return result;
         }
 
         /// <summary>
@@ -661,6 +722,22 @@ namespace ClarionAssistant.Services
         {
             string method = msg["method"] as string;
             if (string.IsNullOrEmpty(method)) return;
+
+            // Telemetry: count every notification method we see, and keep a preview of
+            // the most recent one so the debug tool can show the raw shape.
+            lock (_debugLock)
+            {
+                int cur;
+                _notificationCounts.TryGetValue(method, out cur);
+                _notificationCounts[method] = cur + 1;
+                try
+                {
+                    string preview = _serializer.Serialize(msg);
+                    if (preview.Length > 2000) preview = preview.Substring(0, 2000) + "...";
+                    _lastRawNotificationPreview = preview;
+                }
+                catch { }
+            }
 
             switch (method)
             {
