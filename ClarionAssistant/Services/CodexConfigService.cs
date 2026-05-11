@@ -28,11 +28,17 @@ namespace ClarionAssistant.Services
     /// safety relies on <see cref="File.Replace(string,string,string)"/>'s atomic
     /// ReplaceFileW semantics on NTFS.
     ///
-    /// MARKER COEXISTENCE: Codex CLI itself sometimes appends its own state tables
-    /// (e.g. <c>[tui.model_availability_nux]</c>) at the end of the file, which
-    /// can land inside our marker block when we wrote earlier. Before each
-    /// rewrite, we lift any foreign top-level table out of the managed block so
-    /// it survives.
+    /// MARKER COEXISTENCE: Codex CLI rewrites <c>config.toml</c> through its own
+    /// TOML serializer, which silently drops the trailing end-marker comment
+    /// when it appends state tables (e.g. <c>[tui.model_availability_nux]</c>).
+    /// That leaves the file with a begin marker but no matching end marker; a
+    /// naive replace-or-append would then APPEND a second managed block,
+    /// producing duplicate <c>[mcp_servers.clarion-assistant]</c> tables and
+    /// breaking TOML parsing. <see cref="ReplaceOrAppendManagedBlock"/> is
+    /// therefore self-healing: it strips ALL CA markers and ALL
+    /// <c>[mcp_servers.clarion-assistant.*]</c> sections anywhere in the file,
+    /// lifts foreign tables out of any (possibly broken) managed region, and
+    /// appends one fresh canonical block.
     /// </summary>
     public static class CodexConfigService
     {
@@ -209,150 +215,134 @@ namespace ClarionAssistant.Services
         }
 
         /// <summary>
-        /// Replace the existing managed block (or append a new one), but FIRST
-        /// lift any foreign top-level TOML table out of the existing block to
-        /// preserve content Codex CLI may have written inside our markers
-        /// (e.g. <c>[tui.model_availability_nux]</c>).
+        /// Rewrite the managed block in a self-healing way:
+        /// <list type="bullet">
+        ///   <item>Drop every CA begin/end marker line (paired or orphan).</item>
+        ///   <item>Drop every <c>[mcp_servers.clarion-assistant.*]</c> section
+        ///         anywhere in the file. The fresh block owns this content;
+        ///         leftover copies would crash TOML parsing with a duplicate-key
+        ///         error.</item>
+        ///   <item>Lift foreign top-level sections out of any region that was
+        ///         between CA markers (e.g. <c>[tui.model_availability_nux]</c>
+        ///         that Codex CLI wrote inside our markers after stripping our
+        ///         trailing end-marker comment) so they survive the rewrite.</item>
+        ///   <item>Append one fresh canonical managed block at the end.</item>
+        /// </list>
         ///
-        /// "Foreign" = any <c>[...]</c> section header whose name does NOT start
-        /// with <c>mcp_servers.clarion-assistant</c>. Lifted sections are appended
-        /// after the end marker so the next rewrite leaves them alone.
+        /// NOTE: This is a line scanner, not a full TOML parser. It tracks
+        /// multi-line basic / literal string state (<c>"""..."""</c> /
+        /// <c>'''...'''</c>) so a bracketed token at column 0 inside a multi-line
+        /// string isn't misclassified as a section header.
         /// </summary>
         private static string ReplaceOrAppendManagedBlock(string existing, string managedBlock)
         {
-            int beginIdx = existing.IndexOf(ManagedMarkerBegin, StringComparison.Ordinal);
-            int endIdx   = existing.IndexOf(ManagedMarkerEnd,   StringComparison.Ordinal);
+            if (existing == null) existing = string.Empty;
+            var lines = existing.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
 
-            if (beginIdx >= 0 && endIdx > beginIdx)
-            {
-                // Extract the body between markers (excluding the marker lines themselves).
-                int bodyStart = beginIdx + ManagedMarkerBegin.Length;
-                if (bodyStart < existing.Length && existing[bodyStart] == '\r') bodyStart++;
-                if (bodyStart < existing.Length && existing[bodyStart] == '\n') bodyStart++;
-                string body = existing.Substring(bodyStart, endIdx - bodyStart);
-
-                string foreignTables = ExtractForeignTables(body);
-
-                int after = endIdx + ManagedMarkerEnd.Length;
-                if (after < existing.Length && existing[after] == '\r') after++;
-                if (after < existing.Length && existing[after] == '\n') after++;
-
-                var sb = new StringBuilder();
-                sb.Append(existing, 0, beginIdx);
-                sb.Append(managedBlock);
-                sb.Append(Environment.NewLine);
-                if (!string.IsNullOrEmpty(foreignTables))
-                {
-                    sb.Append(Environment.NewLine);
-                    sb.Append(foreignTables);
-                    if (!foreignTables.EndsWith("\n", StringComparison.Ordinal))
-                        sb.Append(Environment.NewLine);
-                }
-                sb.Append(existing, after, existing.Length - after);
-                return sb.ToString();
-            }
-
-            // Append. Separate from any existing content with a blank line.
-            var append = new StringBuilder(existing);
-            if (append.Length > 0 && !existing.EndsWith("\n", StringComparison.Ordinal))
-                append.Append(Environment.NewLine);
-            if (append.Length > 0)
-                append.Append(Environment.NewLine);
-            append.Append(managedBlock);
-            append.Append(Environment.NewLine);
-            return append.ToString();
-        }
-
-        /// <summary>
-        /// Walk the supplied TOML body line-by-line and return only the sections
-        /// (header + body lines up to the next header) whose section name does NOT
-        /// start with <see cref="ManagedTablePrefix"/>. Returns an empty string if
-        /// no foreign tables are present.
-        ///
-        /// NOTE: This is a line scanner, not a full TOML parser. It intentionally
-        /// tracks multi-line basic / literal string state (<c>"""..."""</c> /
-        /// <c>'''...'''</c>) so a bracketed token at column 0 inside a multi-line
-        /// string isn't misclassified as a section header. Any "bare" key=value
-        /// lines that appeared between the begin marker and the first section
-        /// header are intentionally discarded — CA only emits comments and a blank
-        /// line in that region, so anything else is presumed to be a transient
-        /// artifact (Codex CLI's known appended content uses proper section
-        /// headers like <c>[tui.model_availability_nux]</c>).
-        /// </summary>
-        private static string ExtractForeignTables(string body)
-        {
-            if (string.IsNullOrEmpty(body)) return string.Empty;
-
-            var lines = body.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
-            var foreign = new StringBuilder();
-            bool inForeignSection = false;
-            bool inBasicMultiline = false;   // inside """..."""
-            bool inLiteralMultiline = false; // inside '''...'''
+            var keep = new StringBuilder();        // content outside any CA managed region (minus managed sections)
+            var lifted = new StringBuilder();      // foreign sections that were inside CA markers
+            bool inManaged = false;
+            string currentSection = null;
+            bool inBasicMultiline = false;
+            bool inLiteralMultiline = false;
 
             for (int i = 0; i < lines.Length; i++)
             {
                 string line = lines[i];
 
-                // Update multi-line string toggle BEFORE deciding whether to
-                // interpret leading [ as a section header.
+                // CA markers are pure single-line comments and can't appear
+                // inside a multi-line string, so we check them before updating
+                // multi-line state. Whole-line match (with surrounding whitespace
+                // tolerated) avoids false positives.
+                string trimAll = line.Trim();
+                if (trimAll.Equals(ManagedMarkerBegin, StringComparison.Ordinal))
+                {
+                    inManaged = true;
+                    currentSection = null;
+                    continue; // drop marker line
+                }
+                if (trimAll.Equals(ManagedMarkerEnd, StringComparison.Ordinal))
+                {
+                    inManaged = false;
+                    currentSection = null;
+                    continue; // drop marker line
+                }
+
                 int basicCount = CountOccurrences(line, "\"\"\"");
                 int literalCount = CountOccurrences(line, "'''");
-
                 bool wasInMultiline = inBasicMultiline || inLiteralMultiline;
-
                 if ((basicCount % 2) != 0) inBasicMultiline = !inBasicMultiline;
                 if ((literalCount % 2) != 0) inLiteralMultiline = !inLiteralMultiline;
-
                 bool nowInMultiline = inBasicMultiline || inLiteralMultiline;
 
-                // If this line is part of a multi-line string body (open before
-                // and after, or just closing it), preserve it under whichever
-                // section flag was active when the string started.
-                if (wasInMultiline)
+                // Update currentSection only when not inside a multi-line string.
+                if (!wasInMultiline && !nowInMultiline)
                 {
-                    if (inForeignSection)
+                    string ltrim = line.TrimStart();
+                    if (ltrim.StartsWith("[", StringComparison.Ordinal))
                     {
-                        foreign.Append(Environment.NewLine);
-                        foreign.Append(line);
+                        int closeBracket = ltrim.IndexOf(']');
+                        if (closeBracket > 0)
+                        {
+                            string name = ltrim.Substring(1, closeBracket - 1);
+                            if (name.StartsWith("[", StringComparison.Ordinal)) name = name.Substring(1);
+                            currentSection = name.Trim();
+                        }
                     }
+                }
+
+                bool isManagedSection = currentSection != null
+                    && (currentSection.Equals(ManagedTablePrefix, StringComparison.Ordinal)
+                        || currentSection.StartsWith(ManagedTablePrefix + ".", StringComparison.Ordinal));
+
+                if (isManagedSection)
+                {
+                    // Drop — fresh block owns this. Duplicate would crash TOML.
                     continue;
                 }
 
-                string trimmed = line.TrimStart();
-
-                // Detect section headers: [name] or [[name]] at line start.
-                // Only when not currently inside a multi-line string value.
-                if (!nowInMultiline && trimmed.StartsWith("[", StringComparison.Ordinal))
+                if (inManaged)
                 {
-                    int closeBracket = trimmed.IndexOf(']');
-                    if (closeBracket > 0)
-                    {
-                        // Strip leading [ and any [[ for array-of-tables.
-                        string name = trimmed.Substring(1, closeBracket - 1);
-                        if (name.StartsWith("[", StringComparison.Ordinal)) name = name.Substring(1);
-                        name = name.Trim();
-
-                        bool isManaged = name.Equals(ManagedTablePrefix, StringComparison.Ordinal)
-                            || name.StartsWith(ManagedTablePrefix + ".", StringComparison.Ordinal);
-
-                        inForeignSection = !isManaged;
-                        if (inForeignSection)
-                        {
-                            if (foreign.Length > 0) foreign.Append(Environment.NewLine);
-                            foreign.Append(line);
-                        }
-                        continue;
-                    }
+                    lifted.Append(line).Append(Environment.NewLine);
                 }
-
-                if (inForeignSection)
+                else
                 {
-                    foreign.Append(Environment.NewLine);
-                    foreign.Append(line);
+                    keep.Append(line).Append(Environment.NewLine);
                 }
             }
 
-            return foreign.ToString();
+            string keepStr = TrimTrailingBlankLines(keep.ToString());
+            string liftedStr = TrimTrailingBlankLines(lifted.ToString());
+
+            var sb = new StringBuilder();
+            if (keepStr.Length > 0)
+            {
+                sb.Append(keepStr);
+                sb.Append(Environment.NewLine);
+                sb.Append(Environment.NewLine);
+            }
+            sb.Append(managedBlock);
+            sb.Append(Environment.NewLine);
+            if (liftedStr.Length > 0)
+            {
+                sb.Append(Environment.NewLine);
+                sb.Append(liftedStr);
+                sb.Append(Environment.NewLine);
+            }
+            return sb.ToString();
+        }
+
+        private static string TrimTrailingBlankLines(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            int end = s.Length;
+            while (end > 0)
+            {
+                char c = s[end - 1];
+                if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { end--; continue; }
+                break;
+            }
+            return s.Substring(0, end);
         }
 
         private static int CountOccurrences(string s, string needle)
