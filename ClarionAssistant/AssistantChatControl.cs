@@ -295,7 +295,16 @@ namespace ClarionAssistant
                 case "createCom": OnCreateCom(sender, EventArgs.Empty); break;
                 case "createClass": OnCreateClass(); break;
                 case "evaluateCode": OnEvaluateCode(sender, EventArgs.Empty); break;
-                case "refresh": DetectFromIde(); break;
+                case "refresh":
+                    // Issue #32: refresh button intentionally clears the saved
+                    // version override so the dropdown can be reset to whatever
+                    // the Clarion IDE currently has selected. DetectFromIde() is
+                    // also called from non-user paths (startup, solution change)
+                    // and must NOT clear the override in those cases — that's
+                    // why the clear lives here, not inside DetectFromIde.
+                    _settings.Set("Clarion.Version.Override", "");
+                    DetectFromIde();
+                    break;
                 case "browse": OnBrowseSolution(sender, EventArgs.Empty); break;
                 case "fullIndex": RunIndex(false); break;
                 case "updateIndex": RunIndex(true); break;
@@ -627,6 +636,18 @@ namespace ClarionAssistant
 
             _currentVersionConfig = _versionInfo.GetCurrentConfig();
 
+            // Issue #32: a saved user override wins over IDE-detected, but only
+            // if it still resolves to a real version (the user may have uninstalled
+            // that Clarion edition since the override was saved).
+            string overrideName = _settings.Get("Clarion.Version.Override");
+            ClarionVersionConfig overrideConfig = null;
+            if (!string.IsNullOrEmpty(overrideName))
+            {
+                overrideConfig = _versionInfo.Versions.Find(v => v.Name == overrideName);
+                if (overrideConfig != null)
+                    _currentVersionConfig = overrideConfig;
+            }
+
             var labels = new System.Collections.Generic.List<string>();
             var values = new System.Collections.Generic.List<string>();
             int selectedIdx = 0;
@@ -635,7 +656,9 @@ namespace ClarionAssistant
             {
                 var config = _versionInfo.Versions[i];
                 string label = config.Name;
-                if (_currentVersionConfig != null && config.Name == _currentVersionConfig.Name
+                if (overrideConfig != null && config.Name == overrideConfig.Name)
+                    label += " (saved)";
+                else if (_currentVersionConfig != null && config.Name == _currentVersionConfig.Name
                     && _versionInfo.CurrentVersionName != null
                     && _versionInfo.CurrentVersionName.IndexOf("Current", StringComparison.OrdinalIgnoreCase) >= 0)
                     label += " (active)";
@@ -654,6 +677,15 @@ namespace ClarionAssistant
             if (_versionInfo != null && !string.IsNullOrEmpty(value))
             {
                 _currentVersionConfig = _versionInfo.Versions.Find(v => v.Name == value);
+                if (_currentVersionConfig != null)
+                {
+                    // Issue #32: persist the user's choice so it survives IDE
+                    // reload. Without this, LoadVersions() re-queries the Clarion
+                    // IDE's PropertyService on every load and reverts to whatever
+                    // the IDE itself has selected (e.g. "Clarion.NET 4.0.13372").
+                    _settings.Set("Clarion.Version.Override", value);
+                    LoadVersions(); // refresh labels so the "(saved)" tag appears
+                }
                 LoadRedFile();
             }
         }
