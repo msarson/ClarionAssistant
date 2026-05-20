@@ -23,3 +23,12 @@ ClarionAssistant/.claude/continuation.md
 
 # Project-level Claude config (dev-specific)
 .claude/project.json
+
+# Debug stderr captures from the embedded assistant
+stderr_*.txt
+
+# Sibling project that lives alongside the repo (not part of ClarionAssistant)
+/DatePickerWebviewCOM/
+
+# Local Clarion deploy target written by the sibling project's build
+/Clarion/
