@@ -28,42 +28,89 @@ namespace ClarionAssistant.Services
             if (string.IsNullOrWhiteSpace(procName)) return "No procedure specified.";
             var appTree = new AppTreeService();
 
-            // Only one Clarion embeditor at a time — make sure none is open before we trigger generation.
-            if (!WaitForEmbedClosed(appTree, 2000))
-                return "An embeditor is still open; close it and try again.";
-
-            // Bring the app tree to the front so OpenProcedureEmbed's native automation works even
-            // when a Modern Embeditor tab is currently active.
-            appTree.ActivateAppView();
-
-            // Trigger native generation + Clarion's (transient) embeditor for this procedure.
-            string openLog = appTree.OpenProcedureEmbed(procName);
-
-            // First-time open loads the ABC class libraries and can take many seconds — wait generously
-            // so we don't falsely report failure (and leave a stray embeditor open) on the first procedure.
-            if (!WaitForEmbedOpen(appTree, 45000))
-            {
-                // It may yet open late; try to leave things tidy rather than stranding an embeditor.
-                try { appTree.CancelEmbeditor(); } catch { }
-                return "Embeditor did not open for '" + procName + "' within 45s.\r\n" + openLog;
-            }
-
-            // Mirror the live buffer (full source + editable-region map).
-            string title, source, error;
+            string source, error;
             List<int[]> ranges;
-            bool ok = EmbeditorCompletionService.TryGetActiveEmbeditorSource(out title, out source, out ranges, out error);
+            if (!OpenAndMirror(appTree, procName, out source, out ranges, out error))
+                return error;
 
-            // Release the native lock no matter what — we made no edits, so discard/close.
+            // OpenAndMirror leaves the embeditor open; we made no edits, so discard/close to free the lock.
             try { appTree.CancelEmbeditor(); } catch { }
             WaitForEmbedClosed(appTree, 3000);
 
-            if (!ok) return "Could not read embed source for '" + procName + "': " + error;
-
-            // Title the tab with the procedure name (nicer than the C7pweeN.appclw temp filename).
-            // Passing procName also enables the save round-trip (mirror-mode views can't save).
+            // Title the tab with the procedure name; passing procName also enables the save round-trip.
             var view = new ModernEmbeditorViewContent(procName, source, ranges, "clarion", isDark, procName);
             WorkbenchSingleton.Workbench.ShowView(view);
             return null;
+        }
+
+        // Locator typing speed (ms/char): a quick first pass, then a slower, very reliable retry.
+        // ClaList drops keystrokes typed too fast, so if the quick pass selects the wrong procedure
+        // the verify step below catches it and we retry slower.
+        private static readonly int[] CharDelaysMs = { 70, 130 };
+
+        /// <summary>
+        /// Reliably open the procedure's embeditor and mirror its source + editable-range map, leaving the
+        /// embeditor OPEN on success (caller mirrors/edits then closes). Types the name into the locator at a
+        /// quick speed first; if the WRONG procedure opened (keystrokes dropped), closes and retries slower.
+        /// Verifies the opened source actually belongs to the procedure, so we never proceed on a mis-selected
+        /// one. UI thread only.
+        /// </summary>
+        internal static bool OpenAndMirror(AppTreeService appTree, string procName,
+            out string source, out List<int[]> ranges, out string error)
+        {
+            source = null; ranges = null; error = null;
+            for (int attempt = 0; attempt < CharDelaysMs.Length; attempt++)
+            {
+                if (!WaitForEmbedClosed(appTree, 3000))
+                { error = "An embeditor is still open; close it and try again."; return false; }
+
+                // Bring the app tree to the front so the native automation works even when a Modern
+                // Embeditor tab is the active document.
+                appTree.ActivateAppView();
+                appTree.OpenProcedureEmbed(procName, CharDelaysMs[attempt]);
+
+                // First open loads the ABC libraries and can take many seconds; wait generously.
+                if (!WaitForEmbedOpen(appTree, 45000))
+                {
+                    try { appTree.CancelEmbeditor(); } catch { }
+                    error = "Embeditor did not open for '" + procName + "' within 45s.";
+                    continue;
+                }
+
+                string title, ferr;
+                if (!EmbeditorCompletionService.TryGetActiveEmbeditorSource(out title, out source, out ranges, out ferr))
+                {
+                    try { appTree.CancelEmbeditor(); } catch { }
+                    error = "Could not read embed source for '" + procName + "': " + ferr;
+                    continue;
+                }
+
+                if (SourceMentionsProcedure(source, procName))
+                    return true; // correct procedure — leave the embeditor open
+
+                // Wrong procedure: keystrokes were dropped at this speed. Close and retry slower.
+                try { appTree.CancelEmbeditor(); } catch { }
+                error = "Opened a different procedure than '" + procName + "' — the locator search missed.";
+                source = null; ranges = null;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Sanity check that the assembled embed source belongs to the procedure: its own name appears in
+        /// its generated source (e.g. "Name PROCEDURE"), so if it's absent we almost certainly opened the
+        /// wrong procedure.
+        /// </summary>
+        private static bool SourceMentionsProcedure(string source, string procName)
+        {
+            if (string.IsNullOrEmpty(source) || string.IsNullOrWhiteSpace(procName)) return false;
+            try
+            {
+                return System.Text.RegularExpressions.Regex.IsMatch(
+                    source, @"\b" + System.Text.RegularExpressions.Regex.Escape(procName) + @"\b",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            }
+            catch { return source.IndexOf(procName, StringComparison.OrdinalIgnoreCase) >= 0; }
         }
 
         internal static bool WaitForEmbedOpen(AppTreeService appTree, int timeoutMs)

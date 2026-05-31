@@ -16,6 +16,9 @@
     <Pad id="AgentPanel" category="Tools" title="Agent Panel"
          icon="PadIcons.TaskList" shortcut="Control|Alt|A"
          class="ClarionAssistant.AgentPanelPad"/>
+    <Pad id="ModernData" category="Tools" title="Modern Data"
+         icon="PadIcons.Output" shortcut="Control|Alt|D"
+         class="ClarionAssistant.ModernDataPad"/>
   </Path>
 
   <Path name="/Workspace/Tools">
@@ -27,6 +30,8 @@
               class="ClarionAssistant.ShowAgentPanelCommand"/>
     <MenuItem id="OpenModernEmbeditorPicker" label="Modern Embeditor (open procedures)..."
               class="ClarionAssistant.OpenModernEmbeditorPickerCommand"/>
+    <MenuItem id="ShowModernDataPad" label="Modern Data pad"
+              class="ClarionAssistant.ShowModernDataPadCommand"/>
   </Path>
 
   <!-- Modern Embeditor (Path A) POC: completion-test button on the embeditor toolbar. -->

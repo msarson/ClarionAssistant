@@ -101,6 +101,8 @@
     <Compile Include="EmbeditorCompletionTestCommand.cs" />
     <Compile Include="ShowModernEmbeditorCommand.cs" />
     <Compile Include="OpenModernEmbeditorPickerCommand.cs" />
+    <Compile Include="ShowModernDataPadCommand.cs" />
+    <Compile Include="Terminal\ModernDataPad.cs" />
     <Compile Include="Services\ModernEmbeditorLauncher.cs" />
     <Compile Include="Services\ModernEmbeditorSaver.cs" />
     <Compile Include="Dialogs\ModernEmbeditorPickerDialog.cs" />
@@ -173,6 +175,9 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="Terminal\monaco-embeditor.html">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Terminal\modern-data-pad.html">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="Terminal\settings.html">

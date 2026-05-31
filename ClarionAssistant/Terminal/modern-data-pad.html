@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Modern Data</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { height: 100%; font-family: 'Segoe UI', Tahoma, sans-serif; font-size: 12px;
+        background: #eff1f5; color: #4c4f69; overflow: hidden; }
+    #bar { display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+        background: #dce0e8; border-bottom: 1px solid #bcc0cc; height: 30px; }
+    #bar .title { font-weight: 600; color: #4c4f69; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #bar button { font: inherit; padding: 2px 8px; border: 1px solid #acb0be; border-radius: 4px;
+        background: transparent; color: #1e66f5; cursor: pointer; }
+    #bar button:hover { background: #ccd0da; }
+    #filter { width: 100%; padding: 4px 8px; border: none; border-bottom: 1px solid #bcc0cc;
+        font: inherit; background: #e6e9ef; color: #4c4f69; }
+    #list { position: absolute; top: 56px; left: 0; right: 0; bottom: 0; overflow-y: auto; }
+    .row { display: flex; align-items: center; gap: 8px; padding: 3px 10px; cursor: pointer; user-select: none; }
+    .row:hover { background: #ccd0da; }
+    .row .kind { font-size: 10px; color: #8839ef; min-width: 64px; }
+    .row .name { color: #4c4f69; }
+    .empty { padding: 14px; color: #8c8fa1; }
+    .hint { padding: 6px 10px; color: #8c8fa1; font-size: 11px; border-top: 1px solid #bcc0cc; }
+</style>
+</head>
+<body>
+    <div id="bar">
+        <span class="title" id="title">Data</span>
+        <button id="refreshBtn" title="Refresh from the active Modern Embeditor">Refresh</button>
+    </div>
+    <input id="filter" placeholder="Filter…" />
+    <div id="list"><div class="empty">Open a procedure in the Modern Embeditor, then Refresh.</div></div>
+
+<script>
+    var allItems = [];
+
+    // LSP SymbolKind -> short label
+    function kindLabel(k) {
+        switch (k) {
+            case 5: return 'class'; case 6: return 'method'; case 7: return 'property';
+            case 8: return 'field'; case 10: return 'enum'; case 12: return 'function';
+            case 13: return 'var'; case 14: return 'const'; case 18: return 'array';
+            case 19: return 'group'; case 22: return 'member'; case 23: return 'struct';
+            default: return '';
+        }
+    }
+
+    function postToHost(obj) {
+        try { window.chrome.webview.postMessage(JSON.stringify(obj)); } catch (e) {}
+    }
+
+    function render() {
+        var f = (document.getElementById('filter').value || '').trim().toLowerCase();
+        var list = document.getElementById('list');
+        list.innerHTML = '';
+        var shown = allItems.filter(function (it) {
+            return !f || (it.name && it.name.toLowerCase().indexOf(f) >= 0);
+        });
+        if (shown.length === 0) {
+            list.innerHTML = '<div class="empty">No data symbols. (Is the LSP running? Try Refresh.)</div>';
+            return;
+        }
+        shown.forEach(function (it) {
+            var row = document.createElement('div');
+            row.className = 'row';
+            row.title = it.detail || it.name;
+            var kind = document.createElement('span'); kind.className = 'kind'; kind.textContent = kindLabel(it.kind);
+            var name = document.createElement('span'); name.className = 'name'; name.textContent = it.name;
+            row.appendChild(kind); row.appendChild(name);
+            row.addEventListener('dblclick', function () { postToHost({ action: 'insert', name: it.name }); });
+            list.appendChild(row);
+        });
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', function () { postToHost({ action: 'refresh' }); });
+    document.getElementById('filter').addEventListener('input', render);
+
+    if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.addEventListener('message', function (e) {
+            var msg = e.data;
+            if (typeof msg === 'string') { try { msg = JSON.parse(msg); } catch (ex) { return; } }
+            if (msg.type === 'setSymbols') {
+                document.getElementById('title').textContent = msg.title || 'Data';
+                allItems = msg.items || [];
+                render();
+            }
+        });
+    }
+
+    postToHost({ action: 'ready' });
+</script>
+</body>
+</html>

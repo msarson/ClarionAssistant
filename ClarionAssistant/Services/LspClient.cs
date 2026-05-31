@@ -350,15 +350,27 @@ namespace ClarionAssistant.Services
         /// <summary>
         /// textDocument/documentSymbol - get all symbols in a document.
         /// </summary>
-        public Dictionary<string, object> GetDocumentSymbols(string filePath)
+        public Dictionary<string, object> GetDocumentSymbols(string filePath) { return GetDocumentSymbols(filePath, null); }
+
+        /// <summary>
+        /// textDocument/documentSymbol. When <paramref name="bufferText"/> is supplied (e.g. the Modern
+        /// Embeditor's in-memory buffer, which isn't on disk), it is synced to the server first so symbols
+        /// reflect the live content.
+        /// </summary>
+        public Dictionary<string, object> GetDocumentSymbols(string filePath, string bufferText)
         {
             TrackRequest("symbols", filePath);
-            EnsureDocumentOpen(filePath);
+            try
+            {
+                if (!string.IsNullOrEmpty(bufferText)) EnsureDocumentOpenWithText(filePath, bufferText);
+                else EnsureDocumentOpen(filePath);
+            }
+            catch { }
             var parms = new Dictionary<string, object>
             {
                 { "textDocument", new Dictionary<string, object> { { "uri", FilePathToUri(filePath) } } }
             };
-            return SendRequest("textDocument/documentSymbol", parms);
+            return SendRequest("textDocument/documentSymbol", parms, 3000);
         }
 
         /// <summary>

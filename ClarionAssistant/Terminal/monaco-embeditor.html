@@ -91,6 +91,8 @@
     var saveEnabled = false;      // true when opened from the picker (bound to a procedure)
     var toastTimer = null;
     var saveSafetyTimer = null;   // ensures the "Saving…" toast can never hang forever
+    var pendingRequests = {};     // reqId -> resolver, for async LSP completion/hover round-trips
+    var reqSeq = 0;
 
     function postToHost(obj) {
         try { window.chrome.webview.postMessage(JSON.stringify(obj)); } catch (e) { /* not in webview */ }
@@ -124,6 +126,7 @@
                     monaco.languages.register({ id: 'clarion' });
                     registerClarionLanguage();
                     registerClarionFolding();
+                    registerClarionProviders();
                 }
                 editor = monaco.editor.create(document.getElementById('editor'), {
                     value: '',
@@ -136,18 +139,16 @@
                     mouseWheelZoom: true,   // Ctrl+wheel zooms the editor font (native Monaco)
                     renderWhitespace: 'selection',
                     scrollBeyondLastLine: false,
-                    // No completion in M1 (real LSP/CodeGraph completion is M3). Disable Monaco's
-                    // built-in word suggestions so nothing pops up — especially over read-only code.
-                    quickSuggestions: false,
-                    suggestOnTriggerCharacters: false,
+                    // LSP-backed completion (M3). Use our provider only — no generic word suggestions.
+                    quickSuggestions: true,
+                    suggestOnTriggerCharacters: true,
                     wordBasedSuggestions: 'off',
-                    parameterHints: { enabled: false },
-                    tabCompletion: 'off',
                     folding: true,
                     showFoldingControls: 'always'
                 });
                 installReadOnlyGuard();
                 editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, doSave);
+                editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX, doClarionCut);
                 document.getElementById('saveBtn').addEventListener('click', doSave);
                 ready = true;
                 document.getElementById('loading').classList.add('hidden');
@@ -230,6 +231,44 @@
         return res;
     }
 
+    // ----- Async request/response to the C# host (for LSP completion + hover) -----
+    function requestFromHost(action, payload) {
+        return new Promise(function (resolve) {
+            var reqId = ++reqSeq;
+            pendingRequests[reqId] = resolve;
+            var msg = { action: action, reqId: reqId };
+            if (payload) for (var k in payload) if (payload.hasOwnProperty(k)) msg[k] = payload[k];
+            postToHost(msg);
+            // Don't hang a Monaco provider forever if the host never replies.
+            setTimeout(function () {
+                if (pendingRequests[reqId]) { delete pendingRequests[reqId]; resolve(null); }
+            }, 4000);
+        });
+    }
+
+    function lspKindToMonaco(k) {
+        var M = monaco.languages.CompletionItemKind;
+        switch (k) {
+            case 2: return M.Method; case 3: return M.Function; case 4: return M.Constructor;
+            case 5: return M.Field; case 6: return M.Variable; case 7: return M.Class;
+            case 8: return M.Interface; case 9: return M.Module; case 10: return M.Property;
+            case 12: return M.Value; case 13: return M.Enum; case 14: return M.Keyword;
+            case 15: return M.Snippet; case 21: return M.Constant; case 22: return M.Struct;
+            case 25: return M.TypeParameter; default: return M.Text;
+        }
+    }
+
+    function toMonacoCompletion(it, range) {
+        return {
+            label: it.label,
+            kind: lspKindToMonaco(it.kind),
+            detail: it.detail || undefined,
+            documentation: it.documentation ? { value: it.documentation } : undefined,
+            insertText: it.insertText || it.label,
+            range: range
+        };
+    }
+
     // ----- Save -----
     // Gather each editable slot's CURRENT full-line text from its live (decoration-tracked) range,
     // in the same order as the C# editable ranges, and hand them to the host to persist.
@@ -264,6 +303,39 @@
         if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
         if (!persist)
             toastTimer = setTimeout(function () { t.className = ''; }, ok === false ? 8000 : 6000);
+    }
+
+    // Clarion-style Ctrl+X: with a selection, cut it; with NO selection, clear the whole current line's
+    // text but KEEP the line (Clarion behavior). Both only inside editable slots. This deliberately
+    // replaces Monaco's default Ctrl+X, which cuts the entire line *including the line break* — removing
+    // the line shifts the read-only/editable decorations and makes grey bleed onto editable lines.
+    function doClarionCut() {
+        if (!editor) return;
+        var model = editor.getModel();
+        var sel = editor.getSelection();
+        if (sel && !sel.isEmpty()) {
+            if (!isEditableRange(sel)) return;                 // don't cut across read-only lines
+            postToHost({ action: 'clipboard', text: model.getValueInRange(sel) });
+            editor.executeEdits('clarion-cut', [{ range: sel, text: '' }]);
+        } else {
+            var ln = editor.getPosition().lineNumber;
+            var lineRange = new monaco.Range(ln, 1, ln, model.getLineMaxColumn(ln));
+            if (!isEditableRange(lineRange)) return;            // generated line — leave it alone
+            var lineText = model.getLineContent(ln);
+            if (lineText.length) postToHost({ action: 'clipboard', text: lineText });
+            editor.executeEdits('clarion-cut', [{ range: lineRange, text: '' }]);
+            editor.setPosition({ lineNumber: ln, column: 1 });
+        }
+    }
+
+    // Insert text at the cursor (Modern Data pad double-click). Only inside an editable slot.
+    function insertTextAtCursor(text) {
+        if (!editor || !text) return;
+        var pos = editor.getPosition();
+        var range = new monaco.Range(pos.lineNumber, pos.column, pos.lineNumber, pos.column);
+        if (!isEditableRange(range)) { showToast('Put the cursor in an editable slot to insert', false); return; }
+        editor.executeEdits('data-insert', [{ range: range, text: text, forceMoveMarkers: true }]);
+        editor.focus();
     }
 
     // ----- Read-only guard -----
@@ -346,6 +418,33 @@
         });
     }
 
+    // LSP-backed completion + hover, routed through the C# host to the Clarion language server.
+    function registerClarionProviders() {
+        monaco.languages.registerCompletionItemProvider('clarion', {
+            triggerCharacters: ['.'],
+            provideCompletionItems: function (model, position) {
+                var word = model.getWordUntilPosition(position);
+                var range = new monaco.Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn);
+                return requestFromHost('completion', { line: position.lineNumber, column: position.column })
+                    .then(function (resp) {
+                        var items = (resp && resp.items) || [];
+                        return { suggestions: items.map(function (it) { return toMonacoCompletion(it, range); }) };
+                    })
+                    .catch(function () { return { suggestions: [] }; });
+            }
+        });
+        monaco.languages.registerHoverProvider('clarion', {
+            provideHover: function (model, position) {
+                return requestFromHost('hover', { line: position.lineNumber, column: position.column, buffer: model.getValue() })
+                    .then(function (resp) {
+                        if (!resp || !resp.contents) return null;
+                        return { contents: [{ value: resp.contents }] };
+                    })
+                    .catch(function () { return null; });
+            }
+        });
+    }
+
     // Basic Clarion syntax highlighting (Monarch). Keyword set is intentionally compact for M1.
     function registerClarionLanguage() {
         monaco.languages.setLanguageConfiguration('clarion', {
@@ -404,6 +503,11 @@
             } else if (msg.type === 'saveResult') {
                 if (saveSafetyTimer) { clearTimeout(saveSafetyTimer); saveSafetyTimer = null; }
                 showToast(msg.message, msg.ok);
+            } else if (msg.type === 'response' && msg.reqId != null) {
+                var resolver = pendingRequests[msg.reqId];
+                if (resolver) { delete pendingRequests[msg.reqId]; resolver(msg.data); }
+            } else if (msg.type === 'insertText') {
+                insertTextAtCursor(msg.text);
             }
         });
     }

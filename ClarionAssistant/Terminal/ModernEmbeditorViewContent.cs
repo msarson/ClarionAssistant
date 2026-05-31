@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Threading.Tasks;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using ICSharpCode.SharpDevelop.Gui;
@@ -41,6 +42,7 @@ namespace ClarionAssistant.Terminal
         private readonly string _procedureName;     // set when opened from the picker (enables save)
         private List<string> _originalSlotTexts;     // baseline slot contents for change detection
         private readonly bool _saveEnabled;
+        private readonly string _lspFileName;        // synthetic .clw URI for LSP completion/hover requests
 
         private string _tempDir;
         private const string VIRTUAL_HOST = "clarion-embeditor-data";
@@ -48,6 +50,100 @@ namespace ClarionAssistant.Terminal
         private static readonly List<ModernEmbeditorViewContent> _instances = new List<ModernEmbeditorViewContent>();
 
         public override Control Control { get { return _panel; } }
+
+        /// <summary>The Modern Embeditor tab that's currently the active document, or null.</summary>
+        public static ModernEmbeditorViewContent ActiveModernView()
+        {
+            try
+            {
+                var wb = WorkbenchSingleton.Workbench;
+                if (wb != null)
+                {
+                    // Reflect ActiveWorkbenchWindow -> ViewContent (the property is explicit-interface on the
+                    // workbench itself, so GetProperty by name there returns null — go via the window).
+                    var aw = GetProp(wb, "ActiveWorkbenchWindow");
+                    if (aw != null)
+                    {
+                        var vc = GetProp(aw, "ActiveViewContent") ?? GetProp(aw, "ViewContent");
+                        var m = vc as ModernEmbeditorViewContent;
+                        if (m != null) return m;
+                    }
+                }
+                // Fallback: if exactly one Modern Embeditor is open, it's unambiguous.
+                lock (_instances) { if (_instances.Count == 1) return _instances[0]; }
+                return null;
+            }
+            catch { return null; }
+        }
+
+        private static object GetProp(object obj, string name)
+        {
+            if (obj == null) return null;
+            try
+            {
+                var p = obj.GetType().GetProperty(name,
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                return (p != null && p.GetIndexParameters().Length == 0) ? p.GetValue(obj, null) : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Data symbols (locals/globals/structures) for this procedure, from the LSP document-symbol tree
+        /// over the opened source. Each entry: { name, kind, detail }. Empty if the LSP isn't running.
+        /// </summary>
+        public List<Dictionary<string, object>> GetDataSymbols()
+        {
+            var result = new List<Dictionary<string, object>>();
+            try
+            {
+                var lsp = LspClient.Active;
+                if (lsp == null) return result;
+                var resp = lsp.GetDocumentSymbols(_lspFileName, _sourceText);
+                object res = (resp != null && resp.ContainsKey("result")) ? resp["result"] : null;
+                CollectSymbols(res, result);
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditor] GetDataSymbols: " + ex.Message); }
+            return result;
+        }
+
+        // LSP documentSymbol returns either DocumentSymbol[] (hierarchical, has children) or
+        // SymbolInformation[] (flat). Collect leaf names + kinds from either shape.
+        private static void CollectSymbols(object node, List<Dictionary<string, object>> into)
+        {
+            var list = node as System.Collections.IEnumerable;
+            if (list == null) return;
+            foreach (var item in list)
+            {
+                var d = item as Dictionary<string, object>;
+                if (d == null) continue;
+                string name = d.ContainsKey("name") ? d["name"] as string : null;
+                int kind = 0;
+                if (d.ContainsKey("kind")) { try { kind = Convert.ToInt32(d["kind"]); } catch { } }
+                string detail = d.ContainsKey("detail") ? d["detail"] as string : null;
+                if (!string.IsNullOrEmpty(name))
+                    into.Add(new Dictionary<string, object> { { "name", name }, { "kind", kind }, { "detail", detail } });
+                if (d.ContainsKey("children")) CollectSymbols(d["children"], into);
+            }
+        }
+
+        /// <summary>Insert text at the editor's cursor (used by the Modern Data pad's double-click-insert).</summary>
+        public void InsertAtCursor(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            Action post = () =>
+            {
+                if (_webView == null || _webView.CoreWebView2 == null) return;
+                try
+                {
+                    string json = "{\"type\":\"insertText\",\"text\":" + JsonString(text) + "}";
+                    _webView.CoreWebView2.PostWebMessageAsJson(json);
+                }
+                catch { }
+            };
+            try { if (_panel != null && _panel.InvokeRequired) _panel.BeginInvoke(post); else post(); }
+            catch { }
+        }
 
         public ModernEmbeditorViewContent(string title, string sourceText, List<int[]> editableRanges,
             string language = "clarion", bool isDark = true, string procedureName = null)
@@ -60,6 +156,7 @@ namespace ClarionAssistant.Terminal
             _procedureName = procedureName;
             _saveEnabled = !string.IsNullOrWhiteSpace(procedureName);
             _originalSlotTexts = ModernEmbeditorSaver.ExtractSlotTexts(_sourceText, _editableRanges);
+            _lspFileName = MakeLspFileName(procedureName);
             TitleName = "Modern: " + _title;
 
             _panel = new Panel { Dock = DockStyle.Fill, BackColor = isDark ? Color.FromArgb(30, 30, 46) : Color.FromArgb(239, 241, 245) };
@@ -127,6 +224,12 @@ namespace ClarionAssistant.Terminal
                     SendSource();
                 else if (action == "save")
                     HandleSave(json);
+                else if (action == "clipboard")
+                    HandleClipboard(json);
+                else if (action == "completion")
+                    HandleCompletion(json);
+                else if (action == "hover")
+                    HandleHover(json);
             }
             catch (Exception ex)
             {
@@ -176,6 +279,156 @@ namespace ClarionAssistant.Terminal
                 if (w != null) w.GetType().GetMethod("SelectWindow", Type.EmptyTypes)?.Invoke(w, null);
             }
             catch { }
+        }
+
+        /// <summary>
+        /// LSP completion request from Monaco. Uses the context-free language set (keywords, builtins,
+        /// datatypes, attributes, controls) — no per-keystroke buffer sync needed. Runs off the UI thread
+        /// and posts the result back keyed by reqId.
+        /// </summary>
+        private void HandleCompletion(string json)
+        {
+            int reqId, line, column;
+            if (!ParseRequest(json, out reqId, out line, out column, out _)) return;
+            Task.Run(() =>
+            {
+                var items = new List<Dictionary<string, object>>();
+                try
+                {
+                    var lsp = LspClient.Active;
+                    if (lsp != null)
+                    {
+                        // Context-free: pass no buffer; the server returns the language item set.
+                        var comps = lsp.GetCompletion(_lspFileName, Math.Max(0, line - 1), Math.Max(0, column - 1), 2500, null);
+                        if (comps != null)
+                            foreach (var c in comps)
+                                items.Add(new Dictionary<string, object>
+                                {
+                                    { "label", c.Label },
+                                    { "kind", c.Kind },
+                                    { "detail", c.Detail },
+                                    { "documentation", c.Documentation },
+                                    { "insertText", c.InsertText }
+                                });
+                    }
+                }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditor] completion: " + ex.Message); }
+                PostResponse(reqId, new Dictionary<string, object> { { "items", items } });
+            });
+        }
+
+        /// <summary>LSP hover request from Monaco. Syncs the current buffer (needed to resolve the symbol).</summary>
+        private void HandleHover(string json)
+        {
+            int reqId, line, column; string buffer;
+            if (!ParseRequest(json, out reqId, out line, out column, out buffer)) return;
+            Task.Run(() =>
+            {
+                string contents = null;
+                try
+                {
+                    var lsp = LspClient.Active;
+                    if (lsp != null)
+                    {
+                        var resp = lsp.GetHover(_lspFileName, Math.Max(0, line - 1), Math.Max(0, column - 1), buffer);
+                        contents = ExtractHoverString(resp);
+                    }
+                }
+                catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditor] hover: " + ex.Message); }
+                PostResponse(reqId, new Dictionary<string, object> { { "contents", contents } });
+            });
+        }
+
+        private bool ParseRequest(string json, out int reqId, out int line, out int column, out string buffer)
+        {
+            reqId = 0; line = 0; column = 0; buffer = null;
+            try
+            {
+                var data = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.DeserializeObject(json) as Dictionary<string, object>;
+                if (data == null) return false;
+                if (data.ContainsKey("reqId")) reqId = Convert.ToInt32(data["reqId"]);
+                if (data.ContainsKey("line")) line = Convert.ToInt32(data["line"]);
+                if (data.ContainsKey("column")) column = Convert.ToInt32(data["column"]);
+                if (data.ContainsKey("buffer")) buffer = data["buffer"] as string;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Posts a {type:"response", reqId, data} message back to Monaco (marshaled to the UI thread).</summary>
+        private void PostResponse(int reqId, Dictionary<string, object> data)
+        {
+            Action post = () =>
+            {
+                if (_webView == null || _webView.CoreWebView2 == null) return;
+                try
+                {
+                    var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                    string json = ser.Serialize(new Dictionary<string, object>
+                    {
+                        { "type", "response" }, { "reqId", reqId }, { "data", data }
+                    });
+                    _webView.CoreWebView2.PostWebMessageAsJson(json);
+                }
+                catch { }
+            };
+            try { if (_panel != null && _panel.InvokeRequired) _panel.BeginInvoke(post); else post(); }
+            catch { }
+        }
+
+        /// <summary>Pulls a plain string out of an LSP textDocument/hover response (MarkupContent/string/array).</summary>
+        private static string ExtractHoverString(Dictionary<string, object> resp)
+        {
+            if (resp == null) return null;
+            object result = resp.ContainsKey("result") ? resp["result"] : null;
+            var rd = result as Dictionary<string, object>;
+            object contents = rd != null && rd.ContainsKey("contents") ? rd["contents"] : result;
+            return HoverPartToString(contents);
+        }
+
+        private static string HoverPartToString(object contents)
+        {
+            if (contents == null) return null;
+            var s = contents as string;
+            if (s != null) return s;
+            var d = contents as Dictionary<string, object>;
+            if (d != null && d.ContainsKey("value")) return d["value"] as string;
+            var list = contents as System.Collections.IEnumerable;
+            if (list != null)
+            {
+                var sb = new StringBuilder();
+                foreach (var part in list)
+                {
+                    string p = HoverPartToString(part);
+                    if (!string.IsNullOrEmpty(p)) { if (sb.Length > 0) sb.Append("\n\n"); sb.Append(p); }
+                }
+                return sb.Length > 0 ? sb.ToString() : null;
+            }
+            return null;
+        }
+
+        private static string MakeLspFileName(string procName)
+        {
+            string baseName = string.IsNullOrWhiteSpace(procName) ? "modern_embeditor" : procName;
+            var sb = new StringBuilder();
+            foreach (char c in baseName) sb.Append(char.IsLetterOrDigit(c) || c == '_' ? c : '_');
+            return sb.ToString() + ".clw";
+        }
+
+        /// <summary>Put text on the Windows clipboard (Clarion-style Ctrl+X cut from the editor).</summary>
+        private void HandleClipboard(string json)
+        {
+            try
+            {
+                var ser = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var data = ser.DeserializeObject(json) as Dictionary<string, object>;
+                string text = (data != null && data.ContainsKey("text")) ? (data["text"]?.ToString() ?? "") : null;
+                if (text != null) Clipboard.SetText(text.Length == 0 ? " " : text);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[ModernEmbeditorViewContent] Clipboard error: " + ex.Message);
+            }
         }
 
         private void PostSaveResult(bool ok, string message)

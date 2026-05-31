@@ -63,30 +63,16 @@ namespace ClarionAssistant.Services
             if (changed.Count == 0) { ok = true; return "No changes to save."; }
 
             var appTree = new AppTreeService();
-            if (!ModernEmbeditorLauncher.WaitForEmbedClosed(appTree, 2000))
-                return "Save aborted: another embeditor is open — close it and try again.";
-
-            // The Modern Embeditor tab is the active window when the user saves; bring the app tree to
-            // the front so OpenProcedureEmbed's native automation can actually open the embeditor.
-            appTree.ActivateAppView();
-            appTree.OpenProcedureEmbed(procName);
-            if (!ModernEmbeditorLauncher.WaitForEmbedOpen(appTree, 45000))
-            {
-                try { appTree.CancelEmbeditor(); } catch { }
-                return "Save aborted: couldn't open the embeditor for '" + procName + "'.";
-            }
+            // Reliably re-open the correct procedure (fast Ctrl+V locator, verified, with typing fallback)
+            // and mirror its current source + ranges; leaves the embeditor open for us to write into.
+            string fsource, openErr;
+            List<int[]> franges;
+            if (!ModernEmbeditorLauncher.OpenAndMirror(appTree, procName, out fsource, out franges, out openErr))
+                return "Save aborted: " + openErr;
 
             try
             {
-                // Re-derive the fresh structure and verify it matches the snapshot.
-                string ft, fsource, ferr;
-                List<int[]> franges;
-                if (!EmbeditorCompletionService.TryGetActiveEmbeditorSource(out ft, out fsource, out franges, out ferr))
-                {
-                    try { appTree.CancelEmbeditor(); } catch { }
-                    return "Save aborted: couldn't read the re-opened embeditor (" + ferr + ").";
-                }
-
+                // Embeditor is open with the verified-correct procedure; confirm structure matches snapshot.
                 if (!RangesMatch(franges, originalRanges))
                 {
                     try { appTree.CancelEmbeditor(); } catch { }

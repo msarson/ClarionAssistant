@@ -439,7 +439,17 @@ namespace ClarionAssistant.Services
         /// Iteration 14: PostMessage WM_KEYDOWN/WM_CHAR directly to ClaList handle
         /// + AttachThreadInput for cross-thread focus.
         /// </summary>
-        public string OpenProcedureEmbed(string procedureName)
+        public string OpenProcedureEmbed(string procedureName) { return OpenProcedureEmbed(procedureName, 100); }
+
+        /// <summary>
+        /// Opens the embeditor for a procedure by driving the native app tree. The procedure name is typed
+        /// into the ClaList incremental-search locator one char at a time with <paramref name="charDelayMs"/>
+        /// between keys — ClaList drops keystrokes that arrive too fast, so this can't be rushed. (A Ctrl+V
+        /// paste would be instant but only works when the locator FIELD has focus, which we can't set
+        /// programmatically; WM_CHAR drives the search without focus.) Callers needing certainty should verify
+        /// the opened procedure and retry slower if it mismatched.
+        /// </summary>
+        public string OpenProcedureEmbed(string procedureName, int charDelayMs)
         {
             try
             {
@@ -574,30 +584,27 @@ namespace ClarionAssistant.Services
 
                 if (!selected)
                 {
-                    // Approach 3: PostMessage + WM_CHAR only (matches working SelectProcedure)
-                    log.AppendLine("ClaList does not support LB_ messages (count=" + lbCount + "), using keystrokes");
+                    log.AppendLine("ClaList does not support LB_ messages (count=" + lbCount + "), using locator");
 
+                    log.AppendLine("Typing name via WM_CHAR (" + charDelayMs + "ms/char)");
                     foreach (char c in procedureName)
                     {
                         PostMessage(listHwnd, WM_CHAR, (IntPtr)c, IntPtr.Zero);
                         Application.DoEvents();
-                        System.Threading.Thread.Sleep(100);
+                        System.Threading.Thread.Sleep(charDelayMs < 1 ? 1 : charDelayMs);
                     }
                     Application.DoEvents();
-                    System.Threading.Thread.Sleep(500);
+                    System.Threading.Thread.Sleep(250);
                     Application.DoEvents();
 
-                    log.AppendLine("Posted " + procedureName.Length + " WM_CHAR messages");
-
-                    // Down+Up clears the locator's incremental search buffer
-                    // without changing the selected item
+                    // Down+Up commits the incremental-search highlight as the real selection.
                     PostMessage(listHwnd, WM_KEYDOWN, (IntPtr)0x28, IntPtr.Zero); // VK_DOWN
                     PostMessage(listHwnd, WM_KEYUP, (IntPtr)0x28, IntPtr.Zero);
-                    System.Threading.Thread.Sleep(100);
+                    System.Threading.Thread.Sleep(80);
                     Application.DoEvents();
                     PostMessage(listHwnd, WM_KEYDOWN, (IntPtr)0x26, IntPtr.Zero); // VK_UP
                     PostMessage(listHwnd, WM_KEYUP, (IntPtr)0x26, IntPtr.Zero);
-                    System.Threading.Thread.Sleep(300);
+                    System.Threading.Thread.Sleep(200);
                     Application.DoEvents();
                 }
 
