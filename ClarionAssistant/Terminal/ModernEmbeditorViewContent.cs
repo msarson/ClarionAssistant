@@ -374,6 +374,10 @@ namespace ClarionAssistant.Terminal
                     HandleSaveSettings(json);
                 else if (action == "saveHistory")
                     HandleSaveHistory(json);
+                else if (action == "saveCursor")
+                    HandleSaveCursor(json);
+                else if (action == "saveBookmarks")
+                    HandleSaveBookmarks(json);
             }
             catch (Exception ex)
             {
@@ -573,11 +577,22 @@ namespace ClarionAssistant.Terminal
         /// Modern Embeditor tab so the change is consistent across tabs. Persist failures are logged but
         /// don't block the broadcast — the live editors still reflect the new options for this session.
         /// </summary>
+        // Small fixed-cap parse for the tiny save* bridge payloads (cursor / bookmarks / settings). These
+        // are page-supplied (untrusted) and bounded by design — refuse to materialize an oversized payload
+        // BEFORE deserializing rather than trimming after. (Security gate finding.)
+        private const int MaxBridgeJsonBytes = 65536;   // 64 KB — far above any legit save* message
+        private static Dictionary<string, object> ParseBoundedBridgeJson(string json)
+        {
+            if (string.IsNullOrEmpty(json) || json.Length > MaxBridgeJsonBytes) return null;
+            try { return new JavaScriptSerializer { MaxJsonLength = MaxBridgeJsonBytes }.DeserializeObject(json) as Dictionary<string, object>; }
+            catch { return null; }
+        }
+
         private void HandleSaveSettings(string json)
         {
             try
             {
-                var data = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.DeserializeObject(json) as Dictionary<string, object>;
+                var data = ParseBoundedBridgeJson(json);
                 var sd = (data != null && data.ContainsKey("settings")) ? data["settings"] as Dictionary<string, object> : null;
                 if (sd == null) return;
                 var settings = ModernEmbeditorSettings.FromDict(sd);
@@ -632,6 +647,46 @@ namespace ClarionAssistant.Terminal
                 ApplyHistoryToAll(savedFind, savedReplace);
             }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditor] saveHistory: " + ex.Message); }
+        }
+
+        /// <summary>Persist the cursor position (sent on Ctrl+S) per solution+procedure for restore-on-open.</summary>
+        private void HandleSaveCursor(string json)
+        {
+            try
+            {
+                var data = ParseBoundedBridgeJson(json);
+                if (data == null) return;
+                int line = data.ContainsKey("line") ? Convert.ToInt32(data["line"]) : 0;
+                int column = data.ContainsKey("column") ? Convert.ToInt32(data["column"]) : 0;
+                if (line < 1) return;
+                EnsureHistoryScope();
+                ModernEmbeditorState.SaveCursor(_histSolutionPath, _histProcKey, line, column);
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditor] saveCursor: " + ex.Message); }
+        }
+
+        /// <summary>Persist the bookmark line set (sent whenever it changes) per solution+procedure.</summary>
+        private void HandleSaveBookmarks(string json)
+        {
+            try
+            {
+                var data = ParseBoundedBridgeJson(json);
+                if (data == null) return;
+                var lines = new List<int>();
+                object o;
+                if (data.TryGetValue("bookmarks", out o) && o is object[])
+                {
+                    // Bound ingestion: stop collecting once we have comfortably more than the persist cap
+                    // (200) so a hostile/oversized array from the page can't force a huge allocation before
+                    // CleanLines trims it. (Security gate finding.)
+                    var arr = (object[])o;
+                    for (int i = 0; i < arr.Length && lines.Count < 1000; i++)
+                        if (arr[i] != null) { try { lines.Add(Convert.ToInt32(arr[i])); } catch { } }
+                }
+                EnsureHistoryScope();
+                ModernEmbeditorState.SaveBookmarks(_histSolutionPath, _histProcKey, lines);
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditor] saveBookmarks: " + ex.Message); }
         }
 
         /// <summary>
@@ -828,6 +883,8 @@ namespace ClarionAssistant.Terminal
                 catch { settingsJson = "null"; }
 
                 string findHistJson = "[]", replHistJson = "[]", procHistJson = "[]";
+                int cursorLine = 0, cursorColumn = 0;
+                string bookmarksJson = "[]";
                 try
                 {
                     EnsureHistoryScope();
@@ -836,6 +893,9 @@ namespace ClarionAssistant.Terminal
                     findHistJson = ModernEmbeditorHistory.ToJson(hf);
                     replHistJson = ModernEmbeditorHistory.ToJson(hr);
                     procHistJson = ModernEmbeditorHistory.ToJson(hp);
+                    List<int> bms;
+                    ModernEmbeditorState.Load(_histSolutionPath, _histProcKey, out cursorLine, out cursorColumn, out bms);
+                    bookmarksJson = ModernEmbeditorState.BookmarksJson(bms);
                 }
                 catch { }
 
@@ -849,6 +909,9 @@ namespace ClarionAssistant.Terminal
                     "\"findHistory\":" + findHistJson + "," +
                     "\"replaceHistory\":" + replHistJson + "," +
                     "\"procHistory\":" + procHistJson + "," +
+                    "\"cursorLine\":" + cursorLine + "," +
+                    "\"cursorColumn\":" + cursorColumn + "," +
+                    "\"bookmarks\":" + bookmarksJson + "," +
                     "\"sourceUrl\":\"https://" + VIRTUAL_HOST + "/source.txt\"}";
                 _webView.CoreWebView2.PostWebMessageAsJson(json);
             }

@@ -25,6 +25,19 @@ namespace ClarionAssistant.Services
         public bool Minimap = true;
         public int FontSize = 13;
 
+        /// <summary>
+        /// User key-binding OVERRIDES only: command id → canonical chord string (e.g. "Ctrl+Shift+Y").
+        /// The default chord for every command lives in the HTML command table — C# stores only the
+        /// chords the dev has changed, so re-defaulting a command is just removing its entry. Persisted
+        /// as a single compact-JSON value (no CR/LF) under "ModernEmbeditor.KeyBindings".
+        /// </summary>
+        public Dictionary<string, string> KeyBindings = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        // Safety caps for the untrusted JS payload: bound how many overrides and how long a chord can be
+        // so a crafted settings.txt / postMessage can't bloat the file or the binding map.
+        private const int MaxKeyBindings = 64;
+        private const int MaxChordLength = 40;
+
         private const string Prefix = "ModernEmbeditor.";
 
         /// <summary>Load from SettingsService, falling back to defaults for any missing/invalid key.</summary>
@@ -40,6 +53,7 @@ namespace ClarionAssistant.Services
                 s.WordWrap = GetBool(sv, "WordWrap", s.WordWrap);
                 s.Minimap = GetBool(sv, "Minimap", s.Minimap);
                 s.FontSize = GetInt(sv, "FontSize", s.FontSize, 6, 48);
+                s.KeyBindings = ParseKeyBindings(sv.Get(Prefix + "KeyBindings"));
             }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditorSettings] Load: " + ex.Message); }
             return s;
@@ -55,6 +69,9 @@ namespace ClarionAssistant.Services
             sv.Set(Prefix + "WordWrap", WordWrap ? "true" : "false");
             sv.Set(Prefix + "Minimap", Minimap ? "true" : "false");
             sv.Set(Prefix + "FontSize", Clamp(FontSize, 6, 48).ToString());
+            // Compact JSON, single line — SettingsService rejects CR/LF in values, and the serializer
+            // never emits them. Empty map persists as "{}" (clears any prior overrides).
+            sv.Set(Prefix + "KeyBindings", new JavaScriptSerializer().Serialize(SanitizeBindings(KeyBindings)));
         }
 
         /// <summary>Build a settings instance from the JS payload dict (validated + clamped).</summary>
@@ -68,6 +85,14 @@ namespace ClarionAssistant.Services
             s.WordWrap = ToBool(d, "wordWrap", s.WordWrap);
             s.Minimap = ToBool(d, "minimap", s.Minimap);
             s.FontSize = Clamp(ToInt(d, "fontSize", s.FontSize), 6, 48);
+            object kb;
+            if (d.TryGetValue("keyBindings", out kb) && kb is IDictionary<string, object>)
+            {
+                var map = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var kv in (IDictionary<string, object>)kb)
+                    if (kv.Value != null) map[kv.Key] = kv.Value.ToString();
+                s.KeyBindings = SanitizeBindings(map);
+            }
             return s;
         }
 
@@ -81,8 +106,51 @@ namespace ClarionAssistant.Services
                 { "autoIndent", AutoIndent },
                 { "wordWrap", WordWrap },
                 { "minimap", Minimap },
-                { "fontSize", FontSize }
+                { "fontSize", FontSize },
+                { "keyBindings", SanitizeBindings(KeyBindings) }
             };
+        }
+
+        /// <summary>Deserialize the persisted compact-JSON binding map; tolerant of null/garbage.</summary>
+        private static Dictionary<string, string> ParseKeyBindings(string raw)
+        {
+            var map = new Dictionary<string, string>(StringComparer.Ordinal);
+            if (string.IsNullOrWhiteSpace(raw)) return map;
+            try
+            {
+                var d = new JavaScriptSerializer().DeserializeObject(raw) as Dictionary<string, object>;
+                if (d != null)
+                    foreach (var kv in d)
+                        if (kv.Value != null) map[kv.Key] = kv.Value.ToString();
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditorSettings] ParseKeyBindings: " + ex.Message); }
+            return SanitizeBindings(map);
+        }
+
+        /// <summary>
+        /// Defensive copy: drop empty keys/values, reject CR/LF (would break the line-based settings file)
+        /// and anything past the length/count caps. The HTML owns the canonical command-id list and
+        /// chord grammar; C# only enforces that what it stores can't corrupt settings.txt or balloon.
+        /// </summary>
+        private static Dictionary<string, string> SanitizeBindings(Dictionary<string, string> map)
+        {
+            var outp = new Dictionary<string, string>(StringComparer.Ordinal);
+            if (map == null) return outp;
+            foreach (var kv in map)
+            {
+                if (outp.Count >= MaxKeyBindings) break;
+                string id = kv.Key, chord = kv.Value;
+                if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(chord)) continue;
+                if (chord.Length > MaxChordLength) continue;
+                if (id.IndexOf('\r') >= 0 || id.IndexOf('\n') >= 0) continue;
+                if (chord.IndexOf('\r') >= 0 || chord.IndexOf('\n') >= 0) continue;
+                // Reject HTML metacharacters that are never part of a real chord token. Defense in depth
+                // against a stored-XSS payload reaching the gear panel's keybinding <input value="...">
+                // (the JS escapes too, but a crafted/edited settings.txt shouldn't even hold such a value).
+                if (chord.IndexOf('<') >= 0 || chord.IndexOf('>') >= 0 || chord.IndexOf('"') >= 0) continue;
+                outp[id] = chord;
+            }
+            return outp;
         }
 
         private static int Clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
