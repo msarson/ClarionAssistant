@@ -24,6 +24,17 @@
     .row .name { color: #1f1f1f; }
     .row .type { font-size: 10px; color: #5a5a5a; margin-left: auto; }
     .row .picture { font-size: 10px; color: #0a7d3a; font-family: Consolas, 'Courier New', monospace; min-width: 40px; text-align: right; }
+    .row .pre { font-size: 10px; color: #8a8a8a; margin-left: 8px; }
+    .detail-tog { min-width: 12px; text-align: center; color: #0a5dc2; font-weight: bold; cursor: pointer; font-family: Consolas, 'Courier New', monospace; }
+    .detail-tog:hover { color: #08408a; }
+    .badge { font-size: 9px; font-weight: 700; padding: 0 4px; margin-left: 6px; border-radius: 3px; line-height: 1.4; }
+    .badge.pk { background: #ffe7a3; color: #7a5b00; }
+    .badge.uniq { background: #cfe3ff; color: #0a4a8a; }
+    .detail { font-size: 11px; color: #555; background: #f6f8fa; border-left: 2px solid #cdd9e5; padding: 4px 10px; white-space: normal; }
+    .detail .attr { font-family: Consolas, 'Courier New', monospace; color: #3a3a3a; }
+    .detail .cmt { color: #0a7d3a; font-style: italic; }
+    .comp-row { background: #f6f8fa; }
+    .comp-row .name { color: #1f1f1f; }
     .row .act { color: #0a5dc2; cursor: pointer; min-width: 14px; text-align: center; opacity: 0.6; }
     .row .act:hover { opacity: 1; }
     .twisty { color: #555; min-width: 12px; display: inline-block; text-align: center; }
@@ -45,6 +56,7 @@
 <script>
     var locals = [];
     var tables = [];
+    var otherFiles = [];
     var routines = [];
     var moduleData = [];
     var globals = [];
@@ -52,6 +64,7 @@
     var collapsed = {};        // tableName -> true when a table's columns are collapsed
     var sectionCollapsed = {}; // section key -> true when a whole section is collapsed
     var localCollapsed = {};   // local-tree node path -> true when a QUEUE/GROUP node is collapsed
+    var detailOpen = {};       // node path -> true when an Other Files "+" detail panel is expanded
 
     // LSP SymbolKind -> short label
     function kindLabel(k) {
@@ -136,6 +149,156 @@
             });
         }
 
+        // ----- Other Files: files the proc uses ([FILES][OTHERS]); schema from the LIVE dictionary.
+        //   Minimum-first: prefix shown once at the file header, names listed UNPREFIXED, double-click
+        //   pastes the prefixed (compilable) name. A "+" on each table/key/field expands a detail panel
+        //   (attributes/description/components). Keys + Columns are collapsible sub-folders. -----
+        (function () {
+            var esc = function (s) {
+                return (s == null ? '' : String(s)).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            };
+            var colMatch = function (c) { return match(c.name) || (c.children || []).some(colMatch); };
+            var fileMatch = function (ff) {
+                return match(ff.name) || (ff.columns || []).some(colMatch)
+                    || (ff.keys || []).some(function (k) { return match(k.name); });
+            };
+            if (!otherFiles.filter(fileMatch).length) return;
+            if (!sectionHeader('otherFiles', 'Other Files', otherFiles.length)) return;
+
+            // Fixed left gutter so twisty + "+" align across rows. `hasTwisty`/`open` drive the twisty glyph;
+            // `dkey` (when set) wires the "+" detail toggle. Returns the created row (already appended).
+            function gutterRow(cls, name, type, insertText, padPx, hasTwisty, open, twistyToggle, dkey) {
+                var row = makeRow(cls, null, name, type || '', name, insertText);
+                row.style.paddingLeft = padPx + 'px';
+                // "+" detail toggle (left of name, per design); empty slot keeps alignment when no detail.
+                var plus = document.createElement('span');
+                plus.className = 'detail-tog';
+                if (dkey) {
+                    plus.textContent = detailOpen[dkey] ? '−' : '+';
+                    plus.title = 'Show details';
+                    plus.addEventListener('click', function (e) {
+                        e.stopPropagation(); detailOpen[dkey] = !detailOpen[dkey]; render();
+                    });
+                }
+                row.insertBefore(plus, row.firstChild);
+                // structural twisty (far left)
+                var tw = document.createElement('span');
+                tw.className = 'twisty';
+                tw.textContent = hasTwisty ? (open ? '▾' : '▸') : '';
+                row.insertBefore(tw, row.firstChild);
+                if (hasTwisty && twistyToggle) {
+                    row.addEventListener('click', function (e) { if (e.detail > 1) return; twistyToggle(); });
+                }
+                list.appendChild(row);
+                return row;
+            }
+            function detailPanel(padPx, html) {
+                var d = document.createElement('div');
+                d.className = 'detail'; d.style.paddingLeft = padPx + 'px';
+                d.innerHTML = html;
+                list.appendChild(d);
+            }
+
+            otherFiles.forEach(function (ff) {
+                if (!fileMatch(ff)) return;
+                var fkey = 'of/' + ff.name;
+                var fOpen = !localCollapsed[fkey] || !!f;
+                var fDet = !!(ff.attributes || ff.description);
+                var hdr = gutterRow('table-hdr', ff.name, '', null, 10, true, fOpen,
+                    function () { localCollapsed[fkey] = !localCollapsed[fkey]; render(); },
+                    fDet ? ('d:' + fkey) : null);
+                if (ff.prefix) {
+                    var pp = document.createElement('span'); pp.className = 'pre';
+                    pp.textContent = 'PRE(' + ff.prefix + ')'; hdr.appendChild(pp);
+                }
+                if (fDet && detailOpen['d:' + fkey]) {
+                    var attr = ff.attributes ? '<span class="attr">' + esc(ff.attributes) + '</span>' : '';
+                    var cmt = ff.description ? '<span class="cmt">  ! ' + esc(ff.description) + '</span>' : '';
+                    detailPanel(50, attr + cmt);
+                }
+                if (!fOpen) return;
+
+                // Keys sub-folder
+                var keys = (ff.keys || []).filter(function (k) { return match(k.name) || !f; });
+                if (keys.length) {
+                    var kkey = fkey + '/keys';
+                    var kOpen = !localCollapsed[kkey] || !!f;
+                    gutterRow('table-hdr', 'Keys', '', null, 28, true, kOpen,
+                        function () { localCollapsed[kkey] = !localCollapsed[kkey]; render(); }, null);
+                    if (kOpen) keys.forEach(function (k) {
+                        if (!match(k.name)) return;
+                        var ins = ff.prefix ? ff.prefix + ':' + k.name : k.name;
+                        var kdkey = 'd:' + kkey + '/' + k.name;
+                        var hasKDet = !!((k.components && k.components.length) || k.description || k.keyType);
+                        var kr = gutterRow('col-row', k.name, '', ins, 44, false, false, null,
+                            hasKDet ? kdkey : null);
+                        if (k.primary) { var pb = document.createElement('span'); pb.className = 'badge pk'; pb.textContent = 'PK'; kr.appendChild(pb); }
+                        if (k.unique) { var ub = document.createElement('span'); ub.className = 'badge uniq'; ub.textContent = 'UNIQUE'; kr.appendChild(ub); }
+                        if (hasKDet && detailOpen[kdkey]) {
+                            // Attribute summary line.
+                            var attrs = (k.keyType || 'KEY')
+                                + (k.primary ? ' · Primary' : '') + (k.unique ? ' · Unique' : '')
+                                + (k.caseSensitive ? ' · Case Sensitive' : '');
+                            var head = '<span class="attr">' + attrs + '</span>';
+                            if (k.description) head += '<span class="cmt">  ! ' + esc(k.description) + '</span>';
+                            detailPanel(84, head);
+                            // Each component field on its own readable line (name / type / picture).
+                            (k.components || []).forEach(function (comp) {
+                                var cins = ff.prefix ? ff.prefix + ':' + comp.name : comp.name;
+                                var crow = makeRow('comp-row', null, comp.name, comp.type || '',
+                                    comp.name + (comp.type ? '  ' + comp.type : ''), cins);
+                                crow.style.paddingLeft = '92px';
+                                if (comp.picture) {
+                                    var cp = document.createElement('span');
+                                    cp.className = 'picture'; cp.textContent = comp.picture; crow.appendChild(cp);
+                                }
+                                list.appendChild(crow);
+                            });
+                        }
+                    });
+                }
+
+                // Columns sub-folder
+                var cols = ff.columns || [];
+                if (cols.length) {
+                    var ckey = fkey + '/cols';
+                    var cOpen = !localCollapsed[ckey] || !!f;
+                    gutterRow('table-hdr', 'Columns', '', null, 28, true, cOpen,
+                        function () { localCollapsed[ckey] = !localCollapsed[ckey]; render(); }, null);
+                    if (cOpen) {
+                        var walk = function (arr, depth) {
+                            arr.forEach(function (c) {
+                                if (!colMatch(c)) return;
+                                var kids = c.children || [];
+                                var hasKids = kids.length > 0;
+                                var nkey = ckey + '/' + c.name;
+                                var open = hasKids && (!localCollapsed[nkey] || !!f);
+                                var ins = ff.prefix ? ff.prefix + ':' + c.name : c.name;
+                                var cdkey = 'd:' + nkey;
+                                var hasCDet = !!(c.description || c.derivedFrom);
+                                var row = gutterRow('col-row', c.name, c.type || '', ins, 44 + depth * 16,
+                                    hasKids, open,
+                                    hasKids ? function () { localCollapsed[nkey] = !localCollapsed[nkey]; render(); } : null,
+                                    hasCDet ? cdkey : null);
+                                if (c.picture) {
+                                    var pic = document.createElement('span');
+                                    pic.className = 'picture'; pic.textContent = c.picture; row.appendChild(pic);
+                                }
+                                if (hasCDet && detailOpen[cdkey]) {
+                                    var dl = [];
+                                    if (c.description) dl.push('<span class="cmt">! ' + esc(c.description) + '</span>');
+                                    if (c.derivedFrom) dl.push('<span class="attr">derived from ' + esc(c.derivedFrom) + '</span>');
+                                    detailPanel(84 + depth * 16, dl.join('<br>'));
+                                }
+                                if (open) walk(kids, depth + 1);
+                            });
+                        };
+                        walk(cols, 0);
+                    }
+                }
+            });
+        })();
+
         // ----- Flat scopes -----
         function flatSection(key, label, items, action) {
             var shown = items.filter(function (it) { return match(it.name); });
@@ -219,6 +382,7 @@
                 document.getElementById('title').textContent = msg.title || 'Data';
                 var byName = function (a, b) { return (a.name || '').toLowerCase().localeCompare((b.name || '').toLowerCase()); };
                 locals = (msg.locals || []).slice(); // declaration order — matches Clarion's native Data pad; do NOT sort
+                otherFiles = (msg.otherFiles || []).slice().sort(byName); // Clarion lists Other Files alphabetically
                 routines = (msg.routines || []).slice().sort(byName);
                 moduleData = (msg.moduleData || []).slice().sort(byName);
                 globals = (msg.globals || []).slice(); // declaration order from the .txa [PROGRAM][DATA]; do NOT sort

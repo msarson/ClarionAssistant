@@ -84,7 +84,7 @@ namespace ClarionAssistant
                     if (_panel != null)
                         _panel.BeginInvoke((Action)(() =>
                         {
-                            Terminal.ModernEmbeditorViewContent.RefreshWholeAppTxa();
+                            Terminal.ModernEmbeditorViewContent.RefreshPadSources();
                             Refresh();
                         }));
                     else

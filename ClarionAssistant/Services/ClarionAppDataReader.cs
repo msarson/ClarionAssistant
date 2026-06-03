@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.RegularExpressions;
+using System.Xml;
 
 namespace ClarionAssistant.Services
 {
@@ -18,10 +19,24 @@ namespace ClarionAssistant.Services
             public string Name;
             public string Type;
             public List<FieldDef> Children;
-            // Populated only by the .txa source (ParseTxaProcedureData) — the APP's display metadata.
+            // Populated by the .txa source (ParseTxaProcedureData) / live dict — the APP's display metadata.
             public string Picture;
             public string Prompt;
             public string Header;
+            public string Description; // dictionary column description (live dict)
+            public string DerivedFrom; // source field label if this column is derived (live dict)
+        }
+
+        // A dictionary key/index (rich form, populated by the live dictionary reader).
+        public sealed class KeyDef
+        {
+            public string Name;                                  // unprefixed label (PK_Address_AddressID)
+            public readonly List<FieldDef> Components = new List<FieldDef>(); // member columns (full detail)
+            public string KeyType = "KEY";                       // KEY | INDEX
+            public bool Primary;
+            public bool Unique;
+            public bool CaseSensitive;
+            public string Description;
         }
 
         public sealed class TableDef
@@ -29,7 +44,16 @@ namespace ClarionAssistant.Services
             public string Name;
             public string Prefix = "";
             public readonly List<FieldDef> Fields = new List<FieldDef>();
-            public readonly List<string> Keys = new List<string>();
+            public readonly List<string> Keys = new List<string>();   // legacy name-only (clw/.dcv sources)
+            // Rich attributes, populated by the live dictionary reader (ReadLiveDictionaryTables).
+            public readonly List<KeyDef> KeyDefs = new List<KeyDef>();
+            public string Driver = "";
+            public string DriverOptions = "";
+            public string Owner = "";
+            public string FullName = "";
+            public string Description = "";
+            public bool Bindable;
+            public bool Threaded;
         }
 
         /// <summary>Locate the generated &lt;app&gt;.clw (PROGRAM module) for the currently-open app, or null.</summary>
@@ -129,6 +153,87 @@ namespace ClarionAssistant.Services
             }
             return tables;
         }
+
+        /// <summary>
+        /// Parse table/file definitions from a Clarion dictionary text export (.dcv / .dctx — XML,
+        /// DctxFormat 4). This is the AUTHORITATIVE source for file SCHEMA — columns with TYPE+SIZE and
+        /// ScreenPicture, nested GROUPs (nested &lt;Field&gt;), and keys — which the .app .txa (names only)
+        /// and the generated .clw (no pictures, often stale) lack. Clarion's Auto Export/Import writes this
+        /// whenever a monitored .dct changes, so it stays current without opening the dict alongside the app.
+        /// Used to populate the Modern Data pad's Other Files. Field display name is unprefixed; callers
+        /// prepend TableDef.Prefix (e.g. Add:AddressID).
+        /// </summary>
+        public static List<TableDef> ParseDcvTables(string dcvPath)
+        {
+            var outp = new List<TableDef>();
+            if (string.IsNullOrEmpty(dcvPath) || !File.Exists(dcvPath)) return outp;
+
+            XmlDocument doc;
+            try { doc = new XmlDocument(); doc.Load(dcvPath); }
+            catch { return outp; }
+
+            var root = doc.DocumentElement; // <Dictionary>
+            if (root == null) return outp;
+
+            foreach (XmlNode tbl in root.ChildNodes)
+            {
+                if (tbl.NodeType != XmlNodeType.Element || tbl.Name != "Table") continue;
+                var td = new TableDef { Name = DcvAttr(tbl, "Name"), Prefix = DcvAttr(tbl, "Prefix") };
+                foreach (XmlNode child in tbl.ChildNodes)
+                {
+                    if (child.NodeType != XmlNodeType.Element) continue;
+                    if (child.Name == "Field") td.Fields.Add(DcvField(child));
+                    else if (child.Name == "Key")
+                    {
+                        string kn = DcvAttr(child, "Name");
+                        if (!string.IsNullOrEmpty(kn)) td.Keys.Add(kn);
+                    }
+                }
+                outp.Add(td);
+            }
+            return outp;
+        }
+
+        // One dictionary <Field> → FieldDef, recursing into nested <Field> (GROUP members).
+        private static FieldDef DcvField(XmlNode fld)
+        {
+            var f = new FieldDef
+            {
+                Name = DcvAttr(fld, "Name"),
+                Type = DcvTypeText(DcvAttr(fld, "DataType"), DcvAttr(fld, "Size")),
+                Picture = NullIfEmpty(DcvAttr(fld, "ScreenPicture")),
+                Prompt = NullIfEmpty(DcvAttr(fld, "ScreenPrompt")),
+                Header = NullIfEmpty(DcvAttr(fld, "ReportHeading"))
+            };
+            foreach (XmlNode child in fld.ChildNodes)
+            {
+                if (child.NodeType == XmlNodeType.Element && child.Name == "Field")
+                {
+                    if (f.Children == null) f.Children = new List<FieldDef>();
+                    f.Children.Add(DcvField(child));
+                }
+            }
+            return f;
+        }
+
+        // Clarion declaration type text: string-family types carry their size (CSTRING(61)); others bare.
+        private static string DcvTypeText(string dataType, string size)
+        {
+            if (string.IsNullOrEmpty(dataType)) return "";
+            string dt = dataType.ToUpperInvariant();
+            if (!string.IsNullOrEmpty(size) &&
+                (dt == "CSTRING" || dt == "STRING" || dt == "PSTRING" || dt == "USTRING"))
+                return dataType + "(" + size + ")";
+            return dataType;
+        }
+
+        private static string DcvAttr(XmlNode n, string attr)
+        {
+            var a = n?.Attributes?[attr];
+            return a != null ? a.Value : "";
+        }
+
+        private static string NullIfEmpty(string s) => string.IsNullOrEmpty(s) ? null : s;
 
         // Clarion statement/control keywords that can appear at column 1 in code but are NOT data.
         private static readonly HashSet<string> StatementKeywords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -435,6 +540,58 @@ namespace ClarionAssistant.Services
 
             var hd = Regex.Match(metaLine, @"HEADER\('((?:[^']|'')*)'\)", RegexOptions.IgnoreCase);
             if (hd.Success) f.Header = hd.Groups[1].Value.Replace("''", "'");
+        }
+
+        /// <summary>The dictionary (.dct) path the app was built against, from the TXA header's
+        /// "DICTIONARY '…'" line (the .dcv text export sits beside it). Null if absent.</summary>
+        public static string ParseTxaDictionaryPath(string txaText)
+        {
+            if (string.IsNullOrEmpty(txaText)) return null;
+            var m = Regex.Match(txaText, @"(?m)^\s*DICTIONARY\s+'([^']+)'");
+            return m.Success ? m.Groups[1].Value.Trim() : null;
+        }
+
+        /// <summary>
+        /// The "Other Files" a procedure uses — the file NAMES listed under its [FILES] → [OTHERS] section
+        /// in a whole-app TXA. (Schema for these comes from the dictionary .dcv, not the TXA.) Returns []
+        /// if the procedure has no Other Files.
+        /// </summary>
+        public static List<string> ParseTxaOtherFiles(string txaText, string procName)
+        {
+            var outp = new List<string>();
+            if (string.IsNullOrEmpty(txaText) || string.IsNullOrEmpty(procName)) return outp;
+            var lines = txaText.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].Trim() != "[PROCEDURE]") continue;
+
+                string name = null;
+                int nameAt = -1;
+                for (int j = i + 1; j < Math.Min(i + 6, lines.Length); j++)
+                {
+                    var mt = Regex.Match(lines[j], @"^\s*NAME\s+(.+?)\s*$");
+                    if (mt.Success) { name = mt.Groups[1].Value.Trim(); nameAt = j; break; }
+                }
+                if (name == null || !string.Equals(name, procName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // Within this procedure block, collect the names listed under [OTHERS].
+                bool inOthers = false;
+                for (int k = nameAt + 1; k < lines.Length; k++)
+                {
+                    string t = lines[k].Trim();
+                    if (t == "[PROCEDURE]") break;          // next procedure — stop
+                    if (t == "[OTHERS]") { inOthers = true; continue; }
+                    if (inOthers)
+                    {
+                        if (t.StartsWith("[")) break;        // next section ends the OTHERS list
+                        if (t.Length > 0) outp.Add(t);
+                    }
+                }
+                break;
+            }
+            return outp;
         }
 
         /// <summary>Collect the procedure's ROUTINE names from its source (the "&lt;name&gt; ROUTINE" lines).</summary>

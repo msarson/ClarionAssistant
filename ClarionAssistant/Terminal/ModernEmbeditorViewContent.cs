@@ -159,26 +159,207 @@ namespace ClarionAssistant.Terminal
         private static readonly object _txaLock = new object();
         private static string _wholeAppTxa;
 
+        // Live dictionary snapshot (master, proc-independent): table name -> TableDef (cols w/ pictures +
+        // GROUP nesting, keys). Read from the IDE object model on the UI thread; the Other Files schema
+        // source (replaces the .dcv). See reference_clarion_dict_object_model.
+        private static readonly object _liveLock = new object();
+        private static Dictionary<string, ClarionAppDataReader.TableDef> _liveTables;
+
         /// <summary>
-        /// Export the whole app to a temp .txa and cache its text for Local Data sourcing. Whole-app
-        /// Export(path, all=TRUE) is SILENT + fast (validated live) — UNLIKE proc-only export which pops a
-        /// modal. MUST be called on the UI thread only (it drives the IDE); never from GetPadData, which
-        /// runs on a background thread (a background export is the re-entrancy that locks the IDE). On any
-        /// failure the prior cache is kept and GetPadData falls back to the embeditor-source parse.
+        /// Refresh the Modern Data pad's IDE-sourced caches: (1) the whole-app .txa text (Local/Global Data),
+        /// and (2) a snapshot of the live dictionary tables (Other Files schema). BOTH require the UI thread
+        /// (they touch the IDE / drive a silent whole-app export) — never call from GetPadData, which runs on
+        /// a background thread (a background export/IDE-poke is the re-entrancy that locks the IDE). Each
+        /// source is independent and best-effort: on failure the prior cache is kept and GetPadData falls
+        /// back (embeditor-source for locals, .dcv for Other Files).
         /// </summary>
-        public static void RefreshWholeAppTxa()
+        public static void RefreshPadSources()
         {
+            // (1) Whole-app .txa — silent Export(path, all=TRUE), validated. Source for Local/Global Data.
             try
             {
                 string tmp = Path.Combine(Path.GetTempPath(), "ClarionModernData_wholeapp.txa");
                 string res = new AppTreeService().ExportTxa(tmp);
-                if (string.IsNullOrEmpty(res) || res.StartsWith("Error")) return; // keep prior cache
-                if (!File.Exists(tmp)) return;
-                string text = File.ReadAllText(tmp);
-                if (!string.IsNullOrEmpty(text))
-                    lock (_txaLock) { _wholeAppTxa = text; }
+                if (!string.IsNullOrEmpty(res) && !res.StartsWith("Error") && File.Exists(tmp))
+                {
+                    string text = File.ReadAllText(tmp);
+                    if (!string.IsNullOrEmpty(text)) lock (_txaLock) { _wholeAppTxa = text; }
+                }
             }
-            catch { /* keep prior cache; GetPadData falls back to embeditor-source */ }
+            catch { /* keep prior .txa cache */ }
+
+            // (2) Live dictionary snapshot — the master Tables read from App.FileSchema.DataDictionary.
+            try
+            {
+                var tables = new AppTreeService().ReadLiveDictionaryTables();
+                if (tables != null && tables.Count > 0)
+                {
+                    var map = new Dictionary<string, ClarionAppDataReader.TableDef>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var t in tables)
+                        if (!string.IsNullOrEmpty(t.Name)) map[t.Name] = t;
+                    lock (_liveLock) { _liveTables = map; }
+                }
+            }
+            catch { /* keep prior dict cache; GetOtherFiles falls back to the .dcv */ }
+        }
+
+        // Parsed dictionary (.dcv) tables, cached by path + mtime so we re-parse only when Clarion's
+        // Auto Export/Import rewrites the .dcv. Parsing is pure file I/O + XML (safe on the bg thread).
+        private static readonly object _dcvLock = new object();
+        private static string _dcvPathCached;
+        private static DateTime _dcvMtimeCached;
+        private static List<ClarionAppDataReader.TableDef> _dcvTablesCached;
+
+        private static List<ClarionAppDataReader.TableDef> GetDcvTablesCached(string dcvPath)
+        {
+            if (string.IsNullOrEmpty(dcvPath) || !File.Exists(dcvPath)) return null;
+            var mtime = File.GetLastWriteTimeUtc(dcvPath);
+            lock (_dcvLock)
+            {
+                if (_dcvTablesCached != null && _dcvPathCached == dcvPath && _dcvMtimeCached == mtime)
+                    return _dcvTablesCached;
+            }
+            var parsed = ClarionAppDataReader.ParseDcvTables(dcvPath);
+            lock (_dcvLock) { _dcvPathCached = dcvPath; _dcvMtimeCached = mtime; _dcvTablesCached = parsed; }
+            return parsed;
+        }
+
+        // The dictionary .dcv text export beside the .dct (Clarion Auto Export/Import). Default ext .dcv;
+        // fall back to any *.dcv in the dict folder matching the dict base name (then any) for ext variance.
+        private static string ResolveDcvPath(string dctPath)
+        {
+            if (string.IsNullOrEmpty(dctPath)) return null;
+            try
+            {
+                string dcv = Path.ChangeExtension(dctPath, ".dcv");
+                if (File.Exists(dcv)) return dcv;
+                string dir = Path.GetDirectoryName(dctPath);
+                if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
+                {
+                    string baseName = Path.GetFileNameWithoutExtension(dctPath);
+                    var found = Directory.GetFiles(dir, "*.dcv");
+                    foreach (var x in found)
+                        if (string.Equals(Path.GetFileNameWithoutExtension(x), baseName, StringComparison.OrdinalIgnoreCase))
+                            return x;
+                    if (found.Length > 0) return found[0];
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // Field → JSON dict for an Other Files column. Name is UNPREFIXED (the prefix is shown once at the
+        // file header; the frontend prepends it for double-click insert). Carries detail for the "+" panel.
+        private static Dictionary<string, object> ColToDict(ClarionAppDataReader.FieldDef f)
+        {
+            var d = new Dictionary<string, object> { { "name", f.Name }, { "type", f.Type ?? "" } };
+            if (!string.IsNullOrEmpty(f.Picture)) d["picture"] = f.Picture;
+            // Show a description only when it adds info — the dict often defaults it to the field name.
+            if (!string.IsNullOrEmpty(f.Description) && !string.Equals(f.Description, f.Name, StringComparison.OrdinalIgnoreCase))
+                d["description"] = f.Description;
+            if (!string.IsNullOrEmpty(f.DerivedFrom)) d["derivedFrom"] = f.DerivedFrom;
+            if (!string.IsNullOrEmpty(f.Prompt)) d["prompt"] = f.Prompt;
+            if (!string.IsNullOrEmpty(f.Header)) d["header"] = f.Header;
+            if (f.Children != null && f.Children.Count > 0)
+            {
+                var kids = new List<object>();
+                foreach (var c in f.Children) kids.Add(ColToDict(c));
+                d["children"] = kids;
+            }
+            return d;
+        }
+
+        // Assemble the FILE attribute line for the table-detail panel, e.g.
+        // DRIVER('MSSQL','/TRUSTEDCONNECTION=TRUE'),OWNER(Glo:Connection),NAME('Person.Address'),PRE(Add),BINDABLE,THREAD
+        private static string BuildTableAttributes(ClarionAppDataReader.TableDef t)
+        {
+            var sb = new StringBuilder();
+            Action<string> add = s => { if (sb.Length > 0) sb.Append(","); sb.Append(s); };
+            if (!string.IsNullOrEmpty(t.Driver))
+                add("DRIVER('" + t.Driver + "'" +
+                    (!string.IsNullOrEmpty(t.DriverOptions) ? ",'" + t.DriverOptions + "'" : "") + ")");
+            if (!string.IsNullOrEmpty(t.Owner)) add("OWNER(" + t.Owner + ")");
+            if (!string.IsNullOrEmpty(t.FullName)) add("NAME('" + t.FullName + "')");
+            if (!string.IsNullOrEmpty(t.Prefix)) add("PRE(" + t.Prefix + ")");
+            if (t.Bindable) add("BINDABLE");
+            if (t.Threaded) add("THREAD");
+            return sb.ToString();
+        }
+
+        // KeyDef list → JSON dicts for the Other Files key rows (rich form). Falls back to legacy name-only.
+        private static List<object> KeysToDicts(ClarionAppDataReader.TableDef t)
+        {
+            var keys = new List<object>();
+            if (t.KeyDefs.Count > 0)
+                foreach (var k in t.KeyDefs)
+                {
+                    var comps = new List<object>();
+                    foreach (var c in k.Components) comps.Add(ColToDict(c));
+                    keys.Add(new Dictionary<string, object>
+                    {
+                        { "name", k.Name }, { "components", comps }, { "keyType", k.KeyType },
+                        { "primary", k.Primary }, { "unique", k.Unique },
+                        { "caseSensitive", k.CaseSensitive }, { "description", k.Description ?? "" }
+                    });
+                }
+            else
+                foreach (var kn in t.Keys) keys.Add(new Dictionary<string, object> { { "name", kn } });
+            return keys;
+        }
+
+        /// <summary>
+        /// The procedure's "Other Files": the [FILES][OTHERS] names from the cached whole-app .txa, paired
+        /// with their schema (columns w/ pictures + GROUP nesting, keys) from the dictionary .dcv export.
+        /// If the .dcv isn't available, the files are still listed by name so the section appears.
+        /// </summary>
+        private List<Dictionary<string, object>> GetOtherFiles(string txa)
+        {
+            var outp = new List<Dictionary<string, object>>();
+            try
+            {
+                if (string.IsNullOrEmpty(txa) || string.IsNullOrEmpty(_procedureName)) return outp;
+                var names = ClarionAppDataReader.ParseTxaOtherFiles(txa, _procedureName);
+                if (names.Count == 0) return outp;
+
+                // Schema source: prefer the LIVE dictionary snapshot (always current, no file dependency);
+                // fall back to the dictionary .dcv text export only if the live snapshot isn't available.
+                Dictionary<string, ClarionAppDataReader.TableDef> live;
+                lock (_liveLock) { live = _liveTables; }
+                List<ClarionAppDataReader.TableDef> dcvTables = null; // lazily loaded fallback
+
+                foreach (var n in names)
+                {
+                    ClarionAppDataReader.TableDef t = null;
+                    if (live != null) live.TryGetValue(n, out t);
+                    if (t == null)
+                    {
+                        if (dcvTables == null)
+                            dcvTables = GetDcvTablesCached(ResolveDcvPath(ClarionAppDataReader.ParseTxaDictionaryPath(txa)))
+                                        ?? new List<ClarionAppDataReader.TableDef>();
+                        t = dcvTables.Find(x => string.Equals(x.Name, n, StringComparison.OrdinalIgnoreCase));
+                    }
+                    if (t == null)
+                    {
+                        // Listed but no schema (no live dict / .dcv yet) — still show the file name.
+                        outp.Add(new Dictionary<string, object>
+                        {
+                            { "name", n }, { "prefix", "" }, { "attributes", "" }, { "description", "" },
+                            { "columns", new List<object>() }, { "keys", new List<object>() }
+                        });
+                        continue;
+                    }
+                    var cols = new List<object>();
+                    foreach (var f in t.Fields) cols.Add(ColToDict(f));
+                    outp.Add(new Dictionary<string, object>
+                    {
+                        { "name", t.Name }, { "prefix", t.Prefix },
+                        { "attributes", BuildTableAttributes(t) }, { "description", t.Description ?? "" },
+                        { "columns", cols }, { "keys", KeysToDicts(t) }
+                    });
+                }
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditor] GetOtherFiles: " + ex.Message); }
+            return outp;
         }
 
         /// <summary>
@@ -190,6 +371,7 @@ namespace ClarionAssistant.Terminal
             var locals = new List<Dictionary<string, object>>();
             var routines = new List<Dictionary<string, object>>();
             var globals = new List<Dictionary<string, object>>();
+            var otherFiles = new List<Dictionary<string, object>>();
             try
             {
                 // Prefer the AUTHORITATIVE .txa source (declaration order + pictures + exact Clarion item
@@ -228,6 +410,9 @@ namespace ClarionAssistant.Terminal
                 }
                 foreach (var g in globalDefs)
                     globals.Add(FieldToDict(g));
+
+                // Other Files: the proc's [FILES][OTHERS] names paired with dictionary (.dcv) schema.
+                otherFiles = GetOtherFiles(txa);
             }
             catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[ModernEmbeditor] GetPadData parse: " + ex.Message); }
 
@@ -259,6 +444,7 @@ namespace ClarionAssistant.Terminal
                 { "routines", routines },
                 { "moduleData", moduleData },
                 { "globals", globals },
+                { "otherFiles", otherFiles },
                 { "tables", GetUsedTables() },
                 { "procedures", procedures }
             };
@@ -409,9 +595,9 @@ namespace ClarionAssistant.Terminal
                 if (File.Exists(htmlPath))
                     _webView.CoreWebView2.Navigate(new Uri(htmlPath).AbsoluteUri + "?v=" + File.GetLastWriteTimeUtc(htmlPath).Ticks);
 
-                // On open (UI thread): cache the whole-app .txa so the Data pad's Local Data shows the
-                // app's registered items in declaration order WITH pictures. Silent whole-app export.
-                RefreshWholeAppTxa();
+                // On open (UI thread): refresh the pad's IDE-sourced caches (whole-app .txa for Local/Global
+                // Data; live dictionary snapshot for Other Files). Silent.
+                RefreshPadSources();
             }
             catch (Exception ex)
             {
@@ -490,8 +676,8 @@ namespace ClarionAssistant.Terminal
             if (ok && current.Count == _originalSlotTexts.Count) _originalSlotTexts = current;
             // The save activated the app tree to drive the embeditor — bring this tab back to the front.
             BringToFront();
-            // Re-export the whole-app .txa (UI thread) so the Data pad's Local Data reflects any change.
-            if (ok) RefreshWholeAppTxa();
+            // Refresh the pad's IDE-sourced caches (UI thread) so Local/Global Data + Other Files reflect the save.
+            if (ok) RefreshPadSources();
             PostSaveResult(ok, msg);
         }
 

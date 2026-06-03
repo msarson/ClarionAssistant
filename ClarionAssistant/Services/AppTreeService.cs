@@ -1483,6 +1483,257 @@ namespace ClarionAssistant.Services
         }
 
         /// <summary>
+        /// DIAGNOSTIC reflection explorer (pure MANAGED reflection only — never reinterprets native pointers;
+        /// run on the UI thread). Navigate the IDE object graph starting from the App object by a dot-path
+        /// (segments are property/field names or no-arg getter methods; "Name[3]" indexes arrays/collections),
+        /// then dump the target's type, properties (with values for simple types), fields, and methods.
+        /// Used to discover the in-memory dictionary object model. path="" dumps the App object itself.
+        /// </summary>
+        public string DumpObjectApi(string path)
+        {
+            var sb = new StringBuilder();
+            try
+            {
+                object cur = GetAppObject();
+                if (cur == null) return "Error: no App object — is an .app open?";
+                sb.AppendLine("App = " + cur.GetType().FullName);
+
+                if (!string.IsNullOrWhiteSpace(path))
+                {
+                    foreach (var rawSeg in path.Split('.'))
+                    {
+                        string seg = rawSeg.Trim();
+                        if (seg.Length == 0) continue;
+
+                        int index = -1;
+                        string member = seg;
+                        var mi = Regex.Match(seg, @"^(\w*)\[(\d+)\]$");
+                        if (mi.Success) { member = mi.Groups[1].Value; index = int.Parse(mi.Groups[2].Value); }
+
+                        if (member.Length > 0)
+                        {
+                            object next = GetProp(cur, member) ?? InvokeNoArg(cur, member);
+                            if (next == null) { sb.AppendLine("-> " + seg + " : <null or not found>"); return sb.ToString(); }
+                            cur = next;
+                        }
+                        if (index >= 0)
+                        {
+                            cur = ElementAt(cur, index);
+                            if (cur == null) { sb.AppendLine("-> [" + index + "] : <null / out of range>"); return sb.ToString(); }
+                        }
+                        sb.AppendLine("-> " + seg + " : " + cur.GetType().FullName);
+                    }
+                }
+
+                sb.AppendLine();
+                DumpReflectNode(cur, sb);
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                return sb + "\nError: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
+        private void DumpReflectNode(object obj, StringBuilder sb)
+        {
+            if (obj == null) { sb.AppendLine("(null)"); return; }
+            var t = obj.GetType();
+            sb.AppendLine("TYPE: " + t.FullName);
+
+            if (obj is System.Collections.IEnumerable en && !(obj is string))
+            {
+                int count = 0; object first = null;
+                foreach (var e in en) { if (count == 0) first = e; count++; }
+                sb.AppendLine("ENUMERABLE count=" + count +
+                              (first != null ? "  elem[0] type=" + first.GetType().FullName : ""));
+                if (first != null) { sb.AppendLine("--- element[0] members ---"); DumpReflectMembers(first, sb); }
+                return;
+            }
+            DumpReflectMembers(obj, sb);
+        }
+
+        private void DumpReflectMembers(object obj, StringBuilder sb)
+        {
+            var t = obj.GetType();
+
+            sb.AppendLine("-- Properties --");
+            foreach (var p in t.GetProperties(AllInstance))
+            {
+                if (p.GetIndexParameters().Length > 0) { sb.AppendLine("  [indexer] " + p.PropertyType.Name + " " + p.Name); continue; }
+                string val;
+                try { val = FormatReflectVal(p.GetValue(obj)); } catch { val = "<err>"; }
+                sb.AppendLine("  " + p.PropertyType.Name + " " + p.Name + (val != null ? " = " + val : ""));
+            }
+
+            sb.AppendLine("-- Fields --");
+            foreach (var fld in t.GetFields(AllInstance))
+            {
+                string val;
+                try { val = FormatReflectVal(fld.GetValue(obj)); } catch { val = "<err>"; }
+                sb.AppendLine("  " + fld.FieldType.Name + " " + fld.Name + (val != null ? " = " + val : ""));
+            }
+
+            sb.AppendLine("-- Methods --");
+            foreach (var m in t.GetMethods(AllInstance))
+            {
+                if (m.IsSpecialName) continue; // skip property get_/set_ accessors
+                var psr = string.Join(", ", Array.ConvertAll(m.GetParameters(),
+                    x => x.ParameterType.Name + " " + x.Name));
+                sb.AppendLine("  " + m.ReturnType.Name + " " + m.Name + "(" + psr + ")");
+            }
+        }
+
+        // Inline-print only simple values; complex objects are left for a follow-up path dive (returns null).
+        private static string FormatReflectVal(object v)
+        {
+            if (v == null) return "null";
+            var t = v.GetType();
+            if (t.IsPrimitive || v is string || t.IsEnum) return "\"" + v + "\"";
+            return null;
+        }
+
+        private object InvokeNoArg(object obj, string method)
+        {
+            try
+            {
+                var m = obj.GetType().GetMethod(method, AllInstance, null, Type.EmptyTypes, null);
+                if (m != null && m.ReturnType != typeof(void)) return m.Invoke(obj, null);
+            }
+            catch { }
+            return null;
+        }
+
+        private object ElementAt(object enumerable, int index)
+        {
+            if (enumerable is System.Collections.IEnumerable en)
+            {
+                int i = 0;
+                foreach (var e in en) { if (i == index) return e; i++; }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Read the LIVE in-memory dictionary (App.FileSchema.DataDictionary.Tables) into plain TableDef
+        /// DTOs — Name, Prefix, Fields (with TYPE+size, ScreenPicture, GROUP nesting via DDContainerField /
+        /// GetContainedColumns), and Key names. The authoritative, always-current source for the Modern Data
+        /// pad's Other Files (no .dcv/.txa schema parsing). MANAGED reflection only — never reinterprets
+        /// native pointers. MUST run on the UI thread (live IDE object access). Returns [] if no app/dict.
+        /// </summary>
+        public List<ClarionAppDataReader.TableDef> ReadLiveDictionaryTables()
+        {
+            var outp = new List<ClarionAppDataReader.TableDef>();
+            try
+            {
+                var app = GetAppObject();
+                if (app == null) return outp;
+                var dict = GetProp(GetProp(app, "FileSchema"), "DataDictionary");
+                if (dict == null) return outp;
+                if (!(GetProp(dict, "Tables") is System.Collections.IEnumerable tables)) return outp;
+
+                foreach (var t in tables)
+                {
+                    if (t == null) continue;
+                    var td = new ClarionAppDataReader.TableDef
+                    {
+                        Name = (GetProp(t, "Name") ?? "").ToString(),
+                        Prefix = (GetProp(t, "Prefix") ?? "").ToString(),
+                        Driver = (GetProp(t, "FileDriverName") ?? "").ToString(),
+                        DriverOptions = (GetProp(t, "DriverOptions") ?? "").ToString(),
+                        Owner = StripBang((GetProp(t, "OwnerName") ?? "").ToString()),
+                        FullName = (GetProp(t, "FullPathName") ?? "").ToString(),
+                        Description = (GetProp(t, "Description") ?? "").ToString(),
+                        Bindable = (GetProp(t, "IsBindable") as bool?) ?? false,
+                        Threaded = (GetProp(t, "Threaded") as bool?) ?? false
+                    };
+                    if (GetProp(t, "Fields") is System.Collections.IEnumerable flds)
+                        foreach (var f in flds) td.Fields.Add(ReadLiveField(f));
+                    if (GetProp(t, "Keys") is System.Collections.IEnumerable keys)
+                        foreach (var k in keys) td.KeyDefs.Add(ReadLiveKey(k));
+                    outp.Add(td);
+                }
+            }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine("[AppTree] ReadLiveDictionaryTables: " + ex.Message); }
+            return outp;
+        }
+
+        // One live DDField → FieldDef. Unprefixed Label (callers prepend the table prefix). GROUP fields
+        // (DDContainerField, IsContainer=true) recurse via GetContainedColumns(); children carry own picture.
+        private ClarionAppDataReader.FieldDef ReadLiveField(object fobj)
+        {
+            var f = new ClarionAppDataReader.FieldDef
+            {
+                Name = (GetProp(fobj, "Label") ?? GetProp(fobj, "Name") ?? "").ToString(),
+                Type = LiveFieldType(fobj),
+                Picture = EmptyToNull((GetProp(fobj, "ScreenPicture") ?? "").ToString()),
+                Prompt = EmptyToNull((GetProp(fobj, "PromptText") ?? "").ToString()),
+                Header = EmptyToNull((GetProp(fobj, "ColumnHeading") ?? "").ToString()),
+                Description = EmptyToNull((GetProp(fobj, "Description") ?? "").ToString()),
+                DerivedFrom = EmptyToNull((GetProp(fobj, "DerivedFromFieldName") ?? "").ToString())
+            };
+            bool isContainer = (GetProp(fobj, "IsContainer") as bool?) ?? false;
+            if (isContainer)
+            {
+                var kids = InvokeNoArg(fobj, "GetContainedColumns") as System.Collections.IEnumerable
+                        ?? (GetProp(fobj, "Fields") as System.Collections.IEnumerable);
+                if (kids != null)
+                {
+                    f.Children = new List<ClarionAppDataReader.FieldDef>();
+                    foreach (var c in kids) f.Children.Add(ReadLiveField(c));
+                }
+            }
+            return f;
+        }
+
+        // Clarion declaration type: string-family types carry their size (CSTRING(61)); others bare (LONG,
+        // GROUP, BLOB, DATE…). FieldSize is the declared size (byte length incl. null for CSTRING).
+        private string LiveFieldType(object fobj)
+        {
+            string dt = (GetProp(fobj, "DataType") ?? "").ToString();
+            if (string.IsNullOrEmpty(dt)) return "";
+            string dtU = dt.ToUpperInvariant();
+            if (dtU == "CSTRING" || dtU == "STRING" || dtU == "PSTRING" || dtU == "USTRING")
+            {
+                string sz = (GetProp(fobj, "FieldSize") ?? "").ToString();
+                if (!string.IsNullOrEmpty(sz) && sz != "0") return dt + "(" + sz + ")";
+            }
+            return dt;
+        }
+
+        // One live DDKey → KeyDef. Name unprefixed (Label); components are the member columns' labels.
+        private ClarionAppDataReader.KeyDef ReadLiveKey(object kobj)
+        {
+            var kd = new ClarionAppDataReader.KeyDef
+            {
+                Name = (GetProp(kobj, "Label") ?? GetProp(kobj, "Name") ?? "").ToString(),
+                Primary = (GetProp(kobj, "AttributePrimary") as bool?) ?? false,
+                Unique = (GetProp(kobj, "AttributeUnique") as bool?) ?? false,
+                CaseSensitive = (GetProp(kobj, "AttributeCase") as bool?) ?? false,
+                Description = EmptyToNull((GetProp(kobj, "Description") ?? "").ToString())
+            };
+            var kt = GetProp(kobj, "KeyType");
+            if (kt != null)
+                kd.KeyType = kt.ToString().IndexOf("Index", StringComparison.OrdinalIgnoreCase) >= 0 ? "INDEX" : "KEY";
+            // Components carry full field detail (name/type/picture/description) so the UI can show each
+            // on its own readable line — far better than Clarion's underscore-mashed key name. Use the
+            // CONCRETE KeyComponents list (ComponentsColumn is an explicit-interface member that plain
+            // reflection can't reach); each DDKeyComponent.Field is the real DDField.
+            if (GetProp(kobj, "KeyComponents") is System.Collections.IEnumerable comps)
+                foreach (var comp in comps)
+                {
+                    var fld = GetProp(comp, "Field");
+                    if (fld != null) kd.Components.Add(ReadLiveField(fld));
+                }
+            return kd;
+        }
+
+        // Dictionary OWNER stores "!Glo:Connection" (leading ! = variable, not literal); strip it for display.
+        private static string StripBang(string s) => (s != null && s.StartsWith("!")) ? s.Substring(1) : s;
+
+        private static string EmptyToNull(string s) => string.IsNullOrEmpty(s) ? null : s;
+
+        /// <summary>
         /// Import a TXA file into the current app.
         /// </summary>
         /// <param name="txaPath">Input TXA file path</param>

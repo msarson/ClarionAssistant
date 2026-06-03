@@ -985,6 +985,22 @@ Use this tool to discover IDE APIs and understand what's available for automatio
                 }
             });
 
+            Register(new McpTool
+            {
+                Name = "dump_object_api",
+                Description = "DIAGNOSTIC (pure managed reflection, no IDE mutation): navigate the IDE object graph from the " +
+                              "App object by a dot-path and dump the target's type, properties (with simple values), fields, and " +
+                              "methods. Used to discover the in-memory dictionary object model. Examples: path=\"\" (App itself), " +
+                              "path=\"Dictionary\", path=\"Dictionary.Files[0]\".",
+                InputSchema = McpJsonRpc.BuildSchema(
+                    new Dictionary<string, string>
+                    {
+                        { "path", "Dot-path from the App object (empty = App itself). Segments are property/field/no-arg-getter names; use Name[index] to index a collection." }
+                    }),
+                RequiresUiThread = true,
+                Handler = args => _appTree.DumpObjectApi(McpJsonRpc.GetString(args, "path") ?? "")
+            });
+
             // === File System Tools ===
 
             Register(new McpTool
