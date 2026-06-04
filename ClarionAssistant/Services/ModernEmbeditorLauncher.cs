@@ -29,6 +29,8 @@ namespace ClarionAssistant.Services
             EnterBusy();
             try
             {
+                TimingMark("=== OpenProcedure '" + procName + "' START ===");
+                var swTotal = System.Diagnostics.Stopwatch.StartNew();
                 var appTree = new AppTreeService();
 
                 string source, error;
@@ -36,14 +38,85 @@ namespace ClarionAssistant.Services
                 if (!OpenAndMirror(appTree, procName, out source, out ranges, out error))
                     return error;
 
-                // OpenAndMirror leaves the embeditor open; we made no edits, so discard/close to free the lock.
-                try { appTree.CancelEmbeditor(); } catch { }
-                WaitForEmbedClosed(appTree, 3000);
+                // ABC is loaded now (OpenAndMirror just opened the native embed, which triggers the lazy ABC
+                // load). Warm the LSP HERE — deliberately not at picker-start — so its background solution parse
+                // runs during the WebView2/Monaco load below rather than competing with the ABC load and
+                // ~halving it. Idempotent, fire-and-forget.
+                try { EmbeditorCompletionService.LspStarter?.Invoke(); } catch { }
 
-                // Title the tab with the procedure name; passing procName also enables the save round-trip.
-                var view = new ModernEmbeditorViewContent(procName, source, ranges, "clarion", isDark, procName);
-                WorkbenchSingleton.Workbench.ShowView(view);
+                TimingMark("LSP kicked; about to CancelEmbeditor");
+                // OpenAndMirror leaves the embeditor open; we made no edits, so discard/close to free the lock.
+                var swClose = System.Diagnostics.Stopwatch.StartNew();
+                try { appTree.CancelEmbeditor(); } catch { }
+                TimingMark("CancelEmbeditor returned; waiting for closed");
+                WaitForEmbedClosed(appTree, 3000);
+                TimingLog("CancelEmbeditor+WaitClosed", swClose.ElapsedMilliseconds);
+                TimingLog("OpenProcedure total (pre-deferred-ShowView)", swTotal.ElapsedMilliseconds);
+
+                // CRITICAL — do NOT create the WebView2 view on THIS call stack. We are still unwinding the
+                // nested Application.DoEvents() pumps that drove the native embeditor (SetFocus / AttachThreadInput
+                // / WM_CHAR / BM_CLICK in OpenProcedureEmbed). WebView2's EnsureCoreWebView2Async — kicked off by
+                // ShowView -> Panel.HandleCreated -> async OnHandleCreated — needs a SETTLED, non-reentrant
+                // message-loop turn to complete; created on this reentrant/unsettled stack its await continuation
+                // can't progress and the whole IDE hard-hangs. (This is the freeze: a manual idle GAP before
+                // opening avoided it; ABC warmth was a red herring.) Post ShowView so this entire stack unwinds
+                // and the message/input state drains first — deterministically reproducing that gap.
+                var ctx = WindowsFormsSynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+                string capProc = procName; string capSrc = source; List<int[]> capRanges = ranges; bool capDark = isDark;
+                ctx.Post(_ =>
+                {
+                    try
+                    {
+                        var view = new ModernEmbeditorViewContent(capProc, capSrc, capRanges, "clarion", capDark, capProc);
+                        WorkbenchSingleton.Workbench.ShowView(view);
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine("[ModernEmbeditorLauncher] deferred ShowView failed: " + ex.Message);
+                    }
+                }, null);
                 return null;
+            }
+            finally { LeaveBusy(); }
+        }
+
+        /// <summary>
+        /// Force the IDE's lazy ABC class load to happen NOW (in isolation) so the user's first Modern
+        /// Embeditor open doesn't pay it concurrently with the WebView2 open — the conflict that freezes
+        /// Clarion. Reuses the proven open/cancel pattern: open the first procedure's native embeditor
+        /// (whose source generation loads ABC), then CancelEmbeditor + WaitForEmbedClosed (which pumps
+        /// Application.DoEvents so the native view actually tears down — the step my earlier raw cancel
+        /// missed). NO Monaco view, NO WebView2 — that's what keeps it freeze-free. UI thread only.
+        /// Returns a short diagnostic. Safe to call once per app load (guarded by IsBusy).
+        /// </summary>
+        public static string WarmupAbc()
+        {
+            EnterBusy();
+            try
+            {
+                var appTree = new AppTreeService();
+                var procs = appTree.GetProcedureNames();
+                if (procs == null || procs.Count == 0)
+                    return "ABC warmup skipped: no procedures in the open app.";
+                string proc = procs[0];
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                string source, error;
+                List<int[]> ranges;
+                bool opened = OpenAndMirror(appTree, proc, out source, out ranges, out error);
+
+                // Always close + WAIT (pumps DoEvents until GetEmbedInfo()==null) so the native embeditor
+                // actually tears down — whether or not the mirror read succeeded, the open itself loads ABC.
+                try { appTree.CancelEmbeditor(); } catch { }
+                bool closed = WaitForEmbedClosed(appTree, 5000);
+                appTree.ActivateAppView();
+                sw.Stop();
+
+                if (!opened)
+                    return "ABC warmup: open of '" + proc + "' had trouble (" + error + ") after "
+                           + sw.ElapsedMilliseconds + "ms; ABC may still have loaded. closed=" + closed;
+                return "ABC warmup OK via '" + proc + "' — embed opened+closed in "
+                       + sw.ElapsedMilliseconds + "ms (closed=" + closed + ").";
             }
             finally { LeaveBusy(); }
         }
@@ -63,6 +136,16 @@ namespace ClarionAssistant.Services
         /// <summary>&gt;0 while an embeditor open/save is driving the IDE — pads should not auto-refresh then.</summary>
         private static int _busyCount;
         public static bool IsBusy { get { return _busyCount > 0; } }
+
+        // TEMP diagnostic: append a phase timing to C:\Temp\modern-open-timing.log so we can break down where
+        // the Modern-open wall-clock goes (open vs retry vs mirror vs pad-refresh vs WebView2). Remove once tuned.
+        internal static void TimingLog(string label, long ms) { TimingMark(label + " = " + ms + " ms"); }
+        internal static void TimingMark(string text)
+        {
+            try { System.IO.File.AppendAllText(@"C:\Temp\modern-open-timing.log",
+                System.DateTime.Now.ToString("HH:mm:ss.fff") + "  " + text + "\r\n"); }
+            catch { }
+        }
         internal static void EnterBusy() { System.Threading.Interlocked.Increment(ref _busyCount); }
         internal static void LeaveBusy() { System.Threading.Interlocked.Decrement(ref _busyCount); }
 
@@ -80,17 +163,23 @@ namespace ClarionAssistant.Services
 
                 // Bring the app tree to the front so the native automation works even when a Modern
                 // Embeditor tab is the active document.
+                TimingMark("  attempt " + attempt + " (" + CharDelaysMs[attempt] + "ms/char) START");
                 appTree.ActivateAppView();
+                var swOpen = System.Diagnostics.Stopwatch.StartNew();
                 appTree.OpenProcedureEmbed(procName, CharDelaysMs[attempt]);
+                TimingLog("  attempt " + attempt + " OpenProcedureEmbed", swOpen.ElapsedMilliseconds);
 
                 // First open loads the ABC libraries and can take many seconds; wait generously.
+                var swWait = System.Diagnostics.Stopwatch.StartNew();
                 if (!WaitForEmbedOpen(appTree, 45000))
                 {
                     try { appTree.CancelEmbeditor(); } catch { }
                     error = "Embeditor did not open for '" + procName + "' within 45s.";
                     continue;
                 }
+                TimingLog("  attempt " + attempt + " WaitForEmbedOpen (ABC/native open)", swWait.ElapsedMilliseconds);
 
+                var swMirror = System.Diagnostics.Stopwatch.StartNew();
                 string title, ferr;
                 if (!EmbeditorCompletionService.TryGetActiveEmbeditorSource(out title, out source, out ranges, out ferr))
                 {
@@ -98,12 +187,14 @@ namespace ClarionAssistant.Services
                     error = "Could not read embed source for '" + procName + "': " + ferr;
                     continue;
                 }
+                TimingLog("  attempt " + attempt + " TryGetActiveEmbeditorSource (mirror)", swMirror.ElapsedMilliseconds);
 
                 if (SourceMentionsProcedure(source, procName))
-                    return true; // correct procedure — leave the embeditor open
+                { TimingMark("  attempt " + attempt + " VERIFIED OK"); return true; } // correct procedure — leave the embeditor open
 
                 // Wrong procedure: keystrokes were dropped at this speed. Close and retry slower.
                 try { appTree.CancelEmbeditor(); } catch { }
+                TimingMark("  attempt " + attempt + " MIS-SELECTED — will retry slower");
                 error = "Opened a different procedure than '" + procName + "' — the locator search missed.";
                 source = null; ranges = null;
             }
@@ -129,24 +220,43 @@ namespace ClarionAssistant.Services
             catch { return source.IndexOf(procName, StringComparison.OrdinalIgnoreCase) >= 0; }
         }
 
+        // The native embed/ABC open + close are driven by the UI-thread MESSAGE LOOP. The old coarse
+        // Sleep(50)-per-iteration starved that loop (we slept ~50ms of every tick), inflating a ~2s native
+        // open to ~19s and leaving the embed half-settled for the close. These now pump Application.DoEvents()
+        // at full speed (like the native click path) and only run the reflection-heavy GetEmbedInfo() poll
+        // ~every 120ms, with a 1ms yield to avoid a 100% busy-spin.
+        private const int EmbedPollIntervalMs = 120;
+
         internal static bool WaitForEmbedOpen(AppTreeService appTree, int timeoutMs)
         {
-            for (int waited = 0; waited < timeoutMs; waited += 50)
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            long lastPoll = -EmbedPollIntervalMs;
+            while (sw.ElapsedMilliseconds < timeoutMs)
             {
-                if (appTree.GetEmbedInfo() != null) return true;
                 Application.DoEvents();
-                Thread.Sleep(50);
+                if (sw.ElapsedMilliseconds - lastPoll >= EmbedPollIntervalMs)
+                {
+                    lastPoll = sw.ElapsedMilliseconds;
+                    if (appTree.GetEmbedInfo() != null) return true;
+                }
+                Thread.Sleep(1);
             }
             return appTree.GetEmbedInfo() != null;
         }
 
         internal static bool WaitForEmbedClosed(AppTreeService appTree, int timeoutMs)
         {
-            for (int waited = 0; waited < timeoutMs; waited += 50)
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            long lastPoll = -EmbedPollIntervalMs;
+            while (sw.ElapsedMilliseconds < timeoutMs)
             {
-                if (appTree.GetEmbedInfo() == null) return true;
                 Application.DoEvents();
-                Thread.Sleep(50);
+                if (sw.ElapsedMilliseconds - lastPoll >= EmbedPollIntervalMs)
+                {
+                    lastPoll = sw.ElapsedMilliseconds;
+                    if (appTree.GetEmbedInfo() == null) return true;
+                }
+                Thread.Sleep(1);
             }
             return appTree.GetEmbedInfo() == null;
         }

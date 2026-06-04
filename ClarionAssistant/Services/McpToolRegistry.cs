@@ -1001,6 +1001,30 @@ Use this tool to discover IDE APIs and understand what's available for automatio
                 Handler = args => _appTree.DumpObjectApi(McpJsonRpc.GetString(args, "path") ?? "")
             });
 
+            Register(new McpTool
+            {
+                Name = "dump_appmain_api",
+                Description = "DIAGNOSTIC (read-only reflection): dump the native ApplicationMainWindowControl's managed methods " +
+                              "plus the enum values behind GlobalRequest/GlobalResponse. Used to hunt for a clean managed way to " +
+                              "switch the app's in-window tab to 'Global Embeds' (which triggers the ABC class read).",
+                InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>()),
+                RequiresUiThread = true,
+                Handler = args => _appTree.DumpAppMainControlApi()
+            });
+
+            Register(new McpTool
+            {
+                Name = "warmup_abc",
+                Description = "Force the IDE's lazy ABC class load NOW so the user's first Modern Embeditor open doesn't pay it " +
+                              "concurrently with the WebView2 open (the conflict that freezes Clarion). Opens the first procedure's " +
+                              "native embeditor (its source generation loads ABC), then cancels + waits for it to fully tear down " +
+                              "(pumps DoEvents). No Monaco/WebView2 — that's what keeps it freeze-free. Returns a short diagnostic. " +
+                              "Run once with an .app open.",
+                InputSchema = McpJsonRpc.BuildSchema(new Dictionary<string, string>()),
+                RequiresUiThread = true,
+                Handler = args => ModernEmbeditorLauncher.WarmupAbc()
+            });
+
             // === File System Tools ===
 
             Register(new McpTool

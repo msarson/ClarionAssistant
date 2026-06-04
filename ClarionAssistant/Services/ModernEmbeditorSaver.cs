@@ -92,6 +92,7 @@ namespace ClarionAssistant.Services
                 }
 
                 // Write changed slots bottom-to-top so earlier slots' line numbers stay valid.
+                ModernEmbeditorLauncher.TimingMark("  Saver: writing " + changed.Count + " slot(s)");
                 var errors = new List<string>();
                 foreach (int i in changed.OrderByDescending(x => originalRanges[x][0]))
                 {
@@ -106,8 +107,11 @@ namespace ClarionAssistant.Services
                     return "Save FAILED — nothing persisted:\r\n" + string.Join("\r\n", errors);
                 }
 
+                ModernEmbeditorLauncher.TimingMark("  Saver: SaveAndCloseEmbeditor()");
                 string saveRes = appTree.SaveAndCloseEmbeditor();
+                ModernEmbeditorLauncher.TimingMark("  Saver: SaveAndCloseEmbeditor returned '" + saveRes + "' -> wait closed");
                 ModernEmbeditorLauncher.WaitForEmbedClosed(appTree, 3000);
+                ModernEmbeditorLauncher.TimingMark("  Saver: closed");
                 if (saveRes != null && saveRes.StartsWith("Error", StringComparison.OrdinalIgnoreCase))
                     return "Save error: " + saveRes;
 

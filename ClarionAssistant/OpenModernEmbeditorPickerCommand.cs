@@ -19,10 +19,11 @@ namespace ClarionAssistant
         {
             try
             {
-                // Warm the language server NOW — opening the editor (picker → locator typing → mirror →
-                // WebView2 → Monaco) takes several seconds, so kicking the self-heal here usually has the
-                // LSP ready by the time the dev hovers / presses Ctrl+Space. Idempotent, fire-and-forget.
-                try { EmbeditorCompletionService.LspStarter?.Invoke(); } catch { }
+                // NOTE: the LSP warmup is intentionally NOT kicked here. Kicking it at picker-start spawns the
+                // background solution parse CONCURRENTLY with the native ABC load inside OpenProcedure, which
+                // ~halves the ABC load speed (the native right-click→embeditor path doesn't kick the LSP, so it
+                // loads full-speed). ModernEmbeditorLauncher.OpenProcedure now kicks it AFTER the mirror (ABC
+                // already loaded) so it warms during the WebView2/Monaco load instead of fighting the ABC load.
 
                 var appTree = new AppTreeService();
                 var procs = appTree.GetProcedureDetails();
