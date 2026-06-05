@@ -1711,23 +1711,52 @@ COMMON QUERIES:
                     if (_chatControl == null)
                         return "Error: chat control not initialized";
 
-                    var red = _chatControl.RedFile;
-                    if (red == null || red.RedFilePath == null)
-                        return "Error: no .red file loaded. Select a version and solution first.";
-
                     string fileName = McpJsonRpc.GetString(args, "filename", "");
-                    string section = McpJsonRpc.GetString(args, "section", "Common");
-
                     if (string.IsNullOrEmpty(fileName))
                         return "Error: filename is required";
 
+                    // Prefer the language server's config-aware resolver: it merges the active
+                    // configuration section with Common (and falls back to libsrc), the way the
+                    // compiler does. The local RedFileService only knows the Common section, so it
+                    // misses config-specific paths like .\genfiles\src. Fall back to RedFileService
+                    // only when the LSP is down or the server-side solution hasn't loaded yet.
+                    EnsureLspRunning();
+                    if (_lspClient != null && _lspClient.IsRunning)
+                    {
+                        var hit = _lspClient.FindFile(fileName);
+                        if (hit != null)
+                        {
+                            object p; hit.TryGetValue("path", out p);
+                            string resolvedPath = p as string;
+                            if (!string.IsNullOrEmpty(resolvedPath))
+                            {
+                                object src; hit.TryGetValue("source", out src);
+                                return new Dictionary<string, object>
+                                {
+                                    { "filename", fileName },
+                                    { "resolvedPath", resolvedPath },
+                                    { "found", true },
+                                    { "source", (src as string) ?? "lsp" },
+                                    { "resolver", "lsp" }
+                                };
+                            }
+                        }
+                    }
+
+                    // Fallback: local RedFileService (Common section only).
+                    var red = _chatControl.RedFile;
+                    if (red == null || red.RedFilePath == null)
+                        return "Error: no .red file loaded and LSP unavailable. Select a version and solution first.";
+
+                    string section = McpJsonRpc.GetString(args, "section", "Common");
                     string resolved = red.Resolve(fileName, section);
                     if (resolved != null)
                         return new Dictionary<string, object>
                         {
                             { "filename", fileName },
                             { "resolvedPath", resolved },
-                            { "found", true }
+                            { "found", true },
+                            { "resolver", "redfile-fallback" }
                         };
 
                     // Not found - return the search paths so the user knows where we looked
@@ -1737,7 +1766,8 @@ COMMON QUERIES:
                     {
                         { "filename", fileName },
                         { "found", false },
-                        { "searchedPaths", searchPaths }
+                        { "searchedPaths", searchPaths },
+                        { "resolver", "redfile-fallback" }
                     };
                 }
             });
@@ -1745,12 +1775,16 @@ COMMON QUERIES:
             Register(new McpTool
             {
                 Name = "get_red_search_paths",
-                Description = "Get all search directories for a file extension from the .red file. Useful for discovering where Clarion source files, includes, and libraries are located.",
+                Description = "Get all search directories for a file extension from the .red file. "
+                    + "When 'project_name' is supplied and the language server is running, results are "
+                    + "config-aware (active configuration section merged with Common, the way the compiler "
+                    + "resolves). Without a project_name, falls back to the local Common-section-only lookup.",
                 InputSchema = McpJsonRpc.BuildSchema(
                     new Dictionary<string, string>
                     {
                         { "extension", "File extension to look up (e.g. 'clw', 'inc', 'lib', 'dll')" },
-                        { "section", "Red file section (default: 'Common')" }
+                        { "section", "Red file section for the local fallback (default: 'Common'). Ignored when project_name drives the config-aware LSP lookup." },
+                        { "project_name", "Project name for config-aware resolution via the language server. When set and the LSP is running, returns active-config + Common search paths." }
                     },
                     new[] { "extension" }),
                 RequiresUiThread = false,
@@ -1759,22 +1793,44 @@ COMMON QUERIES:
                     if (_chatControl == null)
                         return "Error: chat control not initialized";
 
-                    var red = _chatControl.RedFile;
-                    if (red == null || red.RedFilePath == null)
-                        return "Error: no .red file loaded. Select a version and solution first.";
-
                     string ext = McpJsonRpc.GetString(args, "extension", "");
-                    string section = McpJsonRpc.GetString(args, "section", "Common");
-
                     if (string.IsNullOrEmpty(ext))
                         return "Error: extension is required";
 
+                    string projectName = McpJsonRpc.GetString(args, "project_name", "");
+
+                    // Config-aware path: delegate to the server when we have a project to scope it to.
+                    if (!string.IsNullOrEmpty(projectName))
+                    {
+                        EnsureLspRunning();
+                        if (_lspClient != null && _lspClient.IsRunning)
+                        {
+                            string normalizedExt = ext.StartsWith(".") ? ext : "." + ext;
+                            var serverPaths = _lspClient.GetServerSearchPaths(projectName, normalizedExt);
+                            if (serverPaths != null && serverPaths.Count > 0)
+                                return new Dictionary<string, object>
+                                {
+                                    { "extension", ext },
+                                    { "projectName", projectName },
+                                    { "searchPaths", serverPaths },
+                                    { "resolver", "lsp" }
+                                };
+                        }
+                    }
+
+                    // Fallback: local RedFileService (single section, default Common).
+                    var red = _chatControl.RedFile;
+                    if (red == null || red.RedFilePath == null)
+                        return "Error: no .red file loaded and LSP unavailable. Select a version and solution first.";
+
+                    string section = McpJsonRpc.GetString(args, "section", "Common");
                     return new Dictionary<string, object>
                     {
                         { "extension", ext },
                         { "section", section },
                         { "searchPaths", red.GetSearchPaths(ext, section) },
-                        { "redFile", red.RedFilePath }
+                        { "redFile", red.RedFilePath },
+                        { "resolver", "redfile-fallback" }
                     };
                 }
             });
@@ -1846,6 +1902,22 @@ COMMON QUERIES:
 
                     string wsUri = "file:///" + wsPath.Replace("\\", "/");
                     string wsName = Path.GetFileName(wsPath);
+
+                    // Send the same redirection/path contract the auto-start path uses, so the
+                    // server resolves the project .red instead of falling back to the install
+                    // default (and flooding "No valid redirection file found"). See
+                    // BuildLspUpdatePaths for the contract details.
+                    try
+                    {
+                        string slnForPaths = _chatControl != null ? _chatControl.CurrentSolutionPath : null;
+                        var updatePaths = BuildLspUpdatePaths(slnForPaths, wsPath);
+                        if (updatePaths != null)
+                            _lspClient.SetUpdatePaths(updatePaths);
+                    }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine("[McpToolRegistry] lsp_start: failed to build updatePaths: " + ex.Message);
+                    }
 
                     bool ok = _lspClient.Start(serverJs, wsUri, wsName);
                     if (ok)
@@ -3937,38 +4009,9 @@ Rebuilds both the bundled and the personal DocGraph DBs when both exist.",
             // Build clarion/updatePaths for cross-file LSP features (definition, references, etc.)
             try
             {
-                var versionConfig = _chatControl.CurrentVersionConfig;
-                if (versionConfig != null)
-                {
-                    var redFile = _chatControl.RedFile;
-                    var redirectionPaths = new List<string>();
-                    var libsrcPaths = new List<string>();
-                    var projectPaths = new List<string>();
-
-                    if (redFile != null)
-                    {
-                        redirectionPaths = redFile.GetSearchPaths(".clw");
-                    }
-
-                    // libsrcPaths from ClarionProperties.xml <libsrc> (not the red file — see #15)
-                    libsrcPaths = versionConfig.LibSrcPaths ?? new List<string>();
-
-                    // projectPaths is just the solution directory (see #16)
-                    projectPaths.Add(wsPath);
-
-                    _lspClient.SetUpdatePaths(new Dictionary<string, object>
-                    {
-                        { "solutionFilePath", slnPath },
-                        { "redirectionFile", versionConfig.RedFilePath ?? "" },
-                        { "clarionVersion", versionConfig.Name ?? "" },
-                        { "configuration", "Debug" },
-                        { "macros", versionConfig.Macros ?? new Dictionary<string, string>() },
-                        { "redirectionPaths", redirectionPaths },
-                        { "libsrcPaths", libsrcPaths },
-                        { "projectPaths", projectPaths },
-                        { "defaultLookupExtensions", new[] { ".clw", ".inc", ".equ", ".int" } }
-                    });
-                }
+                var updatePaths = BuildLspUpdatePaths(slnPath, wsPath);
+                if (updatePaths != null)
+                    _lspClient.SetUpdatePaths(updatePaths);
             }
             catch (Exception ex)
             {
@@ -3978,6 +4021,65 @@ Rebuilds both the bundled and the personal DocGraph DBs when both exist.",
             string wsUri = "file:///" + wsPath.Replace("\\", "/");
             string wsName = Path.GetFileName(wsPath);
             _lspClient.Start(serverJs, wsUri, wsName);
+        }
+
+        /// <summary>
+        /// Builds the clarion/updatePaths payload in the exact shape the Clarion language
+        /// server expects (see Clarion-Extension client SolutionInitializer.ts).
+        ///
+        /// Critical contract — the server's RedirectionFileParserServer locates the effective
+        /// .red with path.join(projectPath, redirectionFile) and
+        /// path.join(redirectionPaths[0], redirectionFile). Therefore:
+        ///   • redirectionFile MUST be a bare filename ("Clarion100.red"), NOT an absolute path.
+        ///     An absolute path makes path.join produce a non-existent path, so the server logs
+        ///     "No valid redirection file found." and never resolves any redirection.
+        ///   • redirectionPaths[0] MUST be the reddir DIRECTORY (where the install/global .red
+        ///     lives) so the install-level fallback resolves. The per-project .red is discovered
+        ///     via projectPaths[0] (the solution directory).
+        ///
+        /// Returns null when there is no version config to build from.
+        /// </summary>
+        private Dictionary<string, object> BuildLspUpdatePaths(string slnPath, string wsPath)
+        {
+            var versionConfig = _chatControl != null ? _chatControl.CurrentVersionConfig : null;
+            if (versionConfig == null) return null;
+
+            // redirectionFile: bare filename only — the server path.join()s it against the
+            // project dir and the reddir. An absolute path here is the bug that breaks resolution.
+            string redirectionFileName = versionConfig.RedFileName ?? "";
+
+            // redirectionPaths[0]: the reddir directory (global red location). Prefer the `reddir`
+            // macro (matches the VS Code client's globalSettings.redirectionPath); fall back to
+            // the install red's own directory (<root>\bin) if the macro is absent.
+            string reddir = null;
+            if (versionConfig.Macros != null)
+                versionConfig.Macros.TryGetValue("reddir", out reddir);
+            if (string.IsNullOrEmpty(reddir) && !string.IsNullOrEmpty(versionConfig.RedFilePath))
+                reddir = Path.GetDirectoryName(versionConfig.RedFilePath);
+
+            var redirectionPaths = new List<string>();
+            if (!string.IsNullOrEmpty(reddir))
+                redirectionPaths.Add(reddir);
+
+            // libsrcPaths from ClarionProperties.xml <libsrc> (not the red file — see #15).
+            var libsrcPaths = versionConfig.LibSrcPaths ?? new List<string>();
+
+            // projectPaths[0] is the solution directory — the server uses it both as the anchor
+            // for project-local .red discovery and as the SolutionManager root (see #16).
+            var projectPaths = new List<string> { wsPath };
+
+            return new Dictionary<string, object>
+            {
+                { "solutionFilePath", slnPath ?? "" },
+                { "redirectionFile", redirectionFileName },
+                { "clarionVersion", versionConfig.Name ?? "" },
+                { "configuration", "Debug" },
+                { "macros", versionConfig.Macros ?? new Dictionary<string, string>() },
+                { "redirectionPaths", redirectionPaths },
+                { "libsrcPaths", libsrcPaths },
+                { "projectPaths", projectPaths },
+                { "defaultLookupExtensions", new[] { ".clw", ".inc", ".equ", ".int" } }
+            };
         }
 
         private string FormatLspResult(Dictionary<string, object> response)
