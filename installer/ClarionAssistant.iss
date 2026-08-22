@@ -1,4 +1,4 @@
-﻿; Clarion Assistant v5.3 Installer
+; Clarion Assistant v5.3 Installer
 ; Inno Setup 6 Script
 ; Supports Clarion 10, 11, 12 — user picks which version(s) to install
 
@@ -68,6 +68,10 @@
 ; NOT the DLL's FileVersion. Upstream freezes FileVersion at 1.0.2.0 across every release, so Inno's
 ; built-in newer-file comparison cannot tell v1.0.2 from v1.2.0 and must not be relied on here.
 #define MarkdownPinVersion "1.3.0"
+; The folder under accessory\addins that this installer owns. Referenced by the [Files] DestDir
+; entries AND mirrored into the Pascal const MarkdownOwnFolder, so the collision check and the copy
+; can never disagree about which folder is ours.
+#define MarkdownFolder "MarkdownEditor"
 ; The directory containing this .iss file itself (SourcePath already ends in "\").
 #define SrcInstaller Copy(SourcePath, 1, Len(SourcePath)-1)
 ; Repo root — for THIRD-PARTY-NOTICES.md, which must ship wherever the addin does.
@@ -456,10 +460,10 @@ Source: "{#SrcLsp}\node_modules\safer-buffer\*"; DestDir: "{code:GetC12Path}\acc
 ; reads the <Identity version> out of any already-installed .addin and declines to overwrite a copy
 ; NEWER than our pin — so a user tracking upstream directly is never silently downgraded.
 #if HaveMarkdown && HaveMarkdownLicense
-Source: "{#SrcMarkdown}\*"; DestDir: "{code:GetC10Path}\accessory\addins\MarkdownEditor"; Components: clarion10 and markdown; Check: ShouldInstallMarkdown('10'); Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#SrcMarkdown}\*"; DestDir: "{code:GetC11Path}\accessory\addins\MarkdownEditor"; Components: clarion11 and markdown; Check: ShouldInstallMarkdown('11'); Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#SrcMarkdown}\*"; DestDir: "{code:GetC111Path}\accessory\addins\MarkdownEditor"; Components: clarion111 and markdown; Check: ShouldInstallMarkdown('111'); Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#SrcMarkdown}\*"; DestDir: "{code:GetC12Path}\accessory\addins\MarkdownEditor"; Components: clarion12 and markdown; Check: ShouldInstallMarkdown('12'); Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SrcMarkdown}\*"; DestDir: "{code:GetC10Path}\accessory\addins\{#MarkdownFolder}"; Components: clarion10 and markdown; Check: ShouldInstallMarkdown('10'); Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SrcMarkdown}\*"; DestDir: "{code:GetC11Path}\accessory\addins\{#MarkdownFolder}"; Components: clarion11 and markdown; Check: ShouldInstallMarkdown('11'); Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SrcMarkdown}\*"; DestDir: "{code:GetC111Path}\accessory\addins\{#MarkdownFolder}"; Components: clarion111 and markdown; Check: ShouldInstallMarkdown('111'); Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SrcMarkdown}\*"; DestDir: "{code:GetC12Path}\accessory\addins\{#MarkdownFolder}"; Components: clarion12 and markdown; Check: ShouldInstallMarkdown('12'); Flags: ignoreversion recursesubdirs createallsubdirs
 #endif
 
 ; --- COM for Clarion: IDE Addin (installs to whichever Clarion version is selected — uses C12 path) ---
@@ -756,11 +760,79 @@ begin
   else Result := 3;
 end;
 
+// The folder THIS installer owns under accessory\addins. ClarionAddinFinder names its folder after
+// the registry id (ClarionMarkdownEditor) instead, and a hand-unzipped copy can be called anything.
+const
+  MarkdownOwnFolder = '{#MarkdownFolder}';
+
+// The <Identity name="..."/> of an .addin manifest, or '' if unreadable. Mirrors
+// ReadAddinIdentityVersion -- the NAME is the collision key the IDE actually enforces.
+function ReadAddinIdentityName(AddinPath: String): String;
+var
+  Raw: AnsiString;
+  T: String;
+  P, Q: Integer;
+begin
+  Result := '';
+  if not FileExists(AddinPath) then Exit;
+  if not LoadStringFromFile(AddinPath, Raw) then Exit;
+  T := String(Raw);
+  P := Pos('<Identity', T);
+  if P = 0 then Exit;
+  T := Copy(T, P, Length(T) - P + 1);
+  P := Pos('name="', T);
+  if P = 0 then Exit;
+  T := Copy(T, P + Length('name="'), Length(T));
+  Q := Pos('"', T);
+  if Q = 0 then Exit;
+  Result := Copy(T, 1, Q - 1);
+end;
+
+// Any folder OTHER than ours under accessory\addins that declares the ClarionMarkdownEditor
+// Identity. Returns its full path, or '' if there is none.
+//
+// Clarion scans EVERY subfolder of accessory\addins, so two folders declaring the same Identity
+// fail IDE startup outright with "Identity name used by multiple addins". We are the newcomer here:
+// the developer's own copy is managed by ClarionAddinFinder (which tracks its installs in its own
+// store) or was placed by hand, so we detect it and stand down rather than touch it.
+function FindForeignMarkdownInstall(Root: String): String;
+var
+  AddinsRoot, Dir, Manifest: String;
+  FindRec: TFindRec;
+begin
+  Result := '';
+  if Root = '' then Exit;
+  AddinsRoot := Root + '\accessory\addins';
+  if not DirExists(AddinsRoot) then Exit;
+
+  if FindFirst(AddinsRoot + '\*', FindRec) then
+  begin
+    try
+      repeat
+        if ((FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0)
+           and (FindRec.Name <> '.') and (FindRec.Name <> '..')
+           and (CompareText(FindRec.Name, MarkdownOwnFolder) <> 0) then
+        begin
+          Dir := AddinsRoot + '\' + FindRec.Name;
+          Manifest := Dir + '\ClarionMarkdownEditor.addin';
+          if CompareText(ReadAddinIdentityName(Manifest), 'ClarionMarkdownEditor') = 0 then
+          begin
+            Result := Dir;
+            Break;
+          end;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 // The actual decision. Do NOT wire this to a [Files] Check directly -- go through
 // ShouldInstallMarkdown, which freezes the answer. See the comment there.
 function DecideInstallMarkdown(Param: String): Boolean;
 var
-  Root, Dir, AddinPath, Installed: String;
+  Root, Dir, AddinPath, Installed, Foreign: String;
 begin
   Root := MarkdownRootFor(Param);
   if Root = '' then
@@ -769,7 +841,20 @@ begin
     Exit;
   end;
 
-  Dir := Root + '\accessory\addins\MarkdownEditor';
+  // Somebody else's copy already claims this Identity. Installing ours beside it is what breaks
+  // IDE startup, so stand down -- and note this is NOT a version comparison: even a copy older than
+  // our pin is left alone, because the duplicate folder is the fault, not the version.
+  Foreign := FindForeignMarkdownInstall(Root);
+  if Foreign <> '' then
+  begin
+    Log('Markdown[' + Param + ']: ClarionMarkdownEditor Identity is already declared by ' + Foreign
+        + ' (not ours) -> skipping install; a second copy would fail IDE startup with '
+        + '"Identity name used by multiple addins"');
+    Result := False;
+    Exit;
+  end;
+
+  Dir := Root + '\accessory\addins\' + MarkdownOwnFolder;
   AddinPath := Dir + '\ClarionMarkdownEditor.addin';
 
   if not FileExists(AddinPath) then
@@ -1649,6 +1734,40 @@ begin
            'Clarion is closed in the other installation(s).', mbError, MB_OK);
 end;
 
+// Remove OUR copy when the developer also has one elsewhere under accessory\addins.
+//
+// Standing down in DecideInstallMarkdown is enough for a machine that never had our copy. It is NOT
+// enough for one that installed CA 5.8/5.8.1 first and added the addin through ClarionAddinFinder
+// afterwards: both folders already exist there and the IDE will not start. Deleting our own folder
+// is what actually repairs that machine.
+//
+// We only ever delete MarkdownEditor, the folder this installer created. The other copy belongs to
+// another tool or to the developer; removing it would be clobbering state we do not own.
+//
+// Runs regardless of whether the Markdown component was selected -- if both folders are present the
+// IDE is broken either way, and a developer who deselected the component still deserves a Clarion
+// that starts.
+procedure RepairMarkdownIdentityCollision(Which: String);
+var
+  Root, Ours, Foreign: String;
+begin
+  Root := MarkdownRootFor(Which);
+  if Root = '' then Exit;
+
+  Ours := Root + '\accessory\addins\' + MarkdownOwnFolder;
+  if not DirExists(Ours) then Exit;
+
+  Foreign := FindForeignMarkdownInstall(Root);
+  if Foreign = '' then Exit;
+
+  Log('Markdown[' + Which + ']: duplicate ClarionMarkdownEditor Identity -- ours at ' + Ours
+      + ', theirs at ' + Foreign + ' -> removing OURS to restore IDE startup');
+  if DelTree(Ours, True, True, True) then
+    Log('Markdown[' + Which + ']: removed ' + Ours)
+  else
+    Log('Markdown[' + Which + ']: FAILED to remove ' + Ours + ' -- the IDE may still refuse to start');
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
@@ -1660,5 +1779,12 @@ begin
     MirrorExtras(2, 'clarion11');
     MirrorExtras(3, 'clarion10');
     SaveClarionPaths;
+
+    // After the copy, so a run that installed into a clean root is not undone by it: this only ever
+    // fires when a foreign copy is present, in which case nothing was installed this run anyway.
+    RepairMarkdownIdentityCollision('10');
+    RepairMarkdownIdentityCollision('11');
+    RepairMarkdownIdentityCollision('111');
+    RepairMarkdownIdentityCollision('12');
   end;
 end;
